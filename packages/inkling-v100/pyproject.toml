@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkling-v100"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+inkling_v100 = "inkling_v100:register"
+
+[tool.setuptools]
+packages = ["inkling_v100", "inkling_v100.ops"]
+
+[tool.setuptools.package-data]
+inkling_v100 = ["csrc/*.cu", "csrc/*.cuh"]
