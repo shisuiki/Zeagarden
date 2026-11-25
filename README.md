@@ -1,2 +1,2 @@
 # Zeagarden
-A place for me to dump optimized multi-kernels.
+A collection of specific optimized multi-kernels and serving frameworks.
