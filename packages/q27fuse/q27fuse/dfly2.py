@@ -598,8 +598,12 @@ class Q27DFly2Speculator(BaseSpeculator):
             return out_exact, None
 
         from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
-        kv_cache = m.attn.kv_cache[0]
+        kv_raw = m.attn.kv_cache
+        kv_cache = kv_raw[0] if isinstance(kv_raw, (list, tuple)) else kv_raw
         k_cache, v_cache = _kv_layout.split_paged_kv_cache(kv_cache)
+        if k_cache.dtype != torch.uint8:
+            k_cache = k_cache.view(torch.uint8)
+            v_cache = v_cache.view(torch.uint8)
         bt = self.block_tables.input_block_tables[self.target_kv_group_ids[layer_idx_in_list]][:B]
 
         if is_gla:
