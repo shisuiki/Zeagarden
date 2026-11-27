@@ -419,11 +419,13 @@ def _ckfix_kernel():
                 start = tl.load(qsl_ptr + rows, mask=live, other=0)
                 end = tl.load(qsl_ptr + rows + 1, mask=live, other=0)
                 ckt = tl.load(spec_ckpt_token_ptr + offsets, mask=live, other=-1)
-                # (1) the round's last token completes the block: its checkpoint column IS the running column
-                tl.store(spec_ckpt_token_ptr + offsets, -1, mask=live & (ckt >= 0) & (ckt == end - start - 1))
                 rn = tl.load(spec_replay_ptr + offsets, mask=live, other=0)
                 req = tl.load(idx_mapping_ptr + rows, mask=live, other=0)
                 computed = tl.load(num_computed_ptr + req, mask=live, other=0)
+                # (1) only mask FULL Mamba-block boundary collisions with running slot; preserve v1.5.4 64-tok decode ckpts!
+                boundary = ((computed + end - start) // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
+                is_full = boundary > computed
+                tl.store(spec_ckpt_token_ptr + offsets, -1, mask=live & is_full & (ckt >= 0) & (ckt == end - start - 1))
                 # (2) this step's commit ends exactly on a block boundary: checkpoint the committed state
                 has = live & (rn > 0) & (computed > 0) & (computed % MAMBA_BLOCK_SIZE == 0)
                 column = computed // MAMBA_BLOCK_SIZE - 1
@@ -456,7 +458,9 @@ def install_ckpt_fix():
     S = SR.SpecReplayState
     if getattr(S, "_q27_ckfix", False):
         return
+    import inspect
     prev_init, prev_prepare = S.__init__, S.prepare
+    prev_has_dec = "decode_ckpt_slots" in inspect.signature(prev_prepare).parameters
 
     def __init__(self, max_reqs, max_rows, num_groups, device):
         prev_init(self, max_reqs, max_rows, num_groups, device)
@@ -464,9 +468,14 @@ def install_ckpt_fix():
         self.q27_plain_ccs = torch.full((num_groups, max_rows), -1, dtype=torch.int32, device=device)
 
     def prepare(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req, is_prefilling,
-                num_reqs, block_table_ptrs, block_table_stride, mamba_block_size):
-        prev_prepare(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req, is_prefilling,
-                     num_reqs, block_table_ptrs, block_table_stride, mamba_block_size)
+                num_reqs, block_table_ptrs, block_table_stride, mamba_block_size, decode_ckpt_slots=None):
+        if prev_has_dec:
+            prev_prepare(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req, is_prefilling,
+                         num_reqs, block_table_ptrs, block_table_stride, mamba_block_size,
+                         decode_ckpt_slots=decode_ckpt_slots)
+        else:
+            prev_prepare(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req, is_prefilling,
+                         num_reqs, block_table_ptrs, block_table_stride, mamba_block_size)
         if not CKPT_FIX or num_reqs == 0:
             return
         if not hasattr(self, "q27_spec_ccs"):           # state built before install_ckpt_fix: allocate now (eager)

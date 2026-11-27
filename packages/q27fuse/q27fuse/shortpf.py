@@ -1,18 +1,13 @@
-"""q27fuse.shortpf (track shortpf) - Exact short/agentic prefill code path (M = 65..768) for 4x V100-SXM2 TP4.
+"""q27fuse.shortpf - Exact short/agentic prefill GEMM kernels (M = 65..512) for 4x V100-SXM2 TP4.
 
-Targets the exact-path cliffs identified in shortpf_anat.txt:
-  1. Q27_SPF_ARN / Q27_SPF_AR (csrc/short_arn.cu):
-     CUDA-graph-safe 1-set zero-epoch 0x7f7f sentinel TP4 Reduce-Scatter + All-Gather returning the COMPLETE FP32
-     residual on every rank. Eliminates CustomAllreduce cross_device_reduce_2stage (497-990 us/call, 48-60% of
-     cold_128/256!) inside piecewise CUDA graphs (80..256) and eager calls up to SPF_ARN_MAX / SPF_AR_MAX.
-  2. Q27_SPF_MLP (csrc/mlp_short.cu):
+  1. Q27_SPF_MLP (csrc/mlp_short.cu):
      Exact single-pass 2D-tiled W4A16 HMMA.884 reading q27_w directly (zero extra weight copies, zero 64-row chunking
-     at 65..256, zero DRAM dequant + k_silu_pair at 257..768).
-  3. Q27_SPF_FP8 (csrc/fp8_short.cu):
-     Exact single-pass 2D-tiled W8A16 HMMA.884 reading 1Cat's QPN8 codes+scales directly (eliminates 10.8 ms
-     fp8_qpn8_dequantize_sm70_kernel + small-M cuBLAS at 65..512).
+     at 65..256, zero DRAM dequant + k_silu_pair at 257..448).
+  2. Q27_SPF_FP8 (csrc/fp8_short.cu):
+     Exact single-pass 2D-tiled W8A16 HMMA.884 reading 1Cat's QPN8 codes+scales directly (eliminates FP8 dequant
+     + small-M cuBLAS overhead at 65..512).
 
-Zero impact on decode (M <= 64) or long prefill (M > max). Every pillar independently toggleable via env vars.
+Note: short- and long-prefill all-reduce + Gemma norm are consolidated into pf2.py (csrc/arn.cu, Q27_ARN=1).
 """
 import logging
 import os
@@ -30,40 +25,30 @@ def _int(name: str, default: int) -> int:
     return int(v) if v else default
 
 
-SPF_ARN = _on("Q27_SPF_ARN", "1")
-SPF_AR = _on("Q27_SPF_AR", "1")
 SPF_MLP = _on("Q27_SPF_MLP", "1")
 SPF_FP8 = _on("Q27_SPF_FP8", "1")
 
-SPF_ARN_MIN = _int("Q27_SPF_ARN_MIN", 65)
-SPF_ARN_MAX = _int("Q27_SPF_ARN_MAX", 1024)
-SPF_AR_MIN = _int("Q27_SPF_AR_MIN", 65)
-SPF_AR_MAX = _int("Q27_SPF_AR_MAX", 1024)
-SPF_MLP_MIN = _int("Q27_SPF_MLP_MIN", 129)
+SPF_MLP_MIN = _int("Q27_SPF_MLP_MIN", 169)
 SPF_MLP_MAX = _int("Q27_SPF_MLP_MAX", 448)
 SPF_FP8_MIN = _int("Q27_SPF_FP8_MIN", 65)
-SPF_FP8_MAX = _int("Q27_SPF_FP8_MAX", 512)
+SPF_FP8_MAX = _int("Q27_SPF_FP8_MAX", 640)
 SPF_FP8_GATED_MAX = _int("Q27_SPF_FP8_GATED_MAX", 448)
+# Per-shape upper row limits tuned against 1Cat-vLLM v1.5.4 (M=65..1024 microbench on V100):
+#   (5120, 4096) hands off to pf_gemm algo 6 at M >= 512 (+1.8 ms at 512, +1.4 ms at 620)
+#   (1536, 5120) keeps fp8_short through 640 (+1.8 ms at 620 vs 1Cat/algo 6)
+#   (5120, 3584) / (4352, 5120) hand off to 1Cat v1.5.4 / pf_gemm above 512 (+1.0 ms at 620)
+FP8_MAX_BY_KN = {(5120, 4096): 448, (5120, 3584): 512, (4352, 5120): 512, (1536, 5120): 640}
 
-# Hardware-tuned per-M config tables from standalone V100 sweeps:
-# short_arn.cu v2 (test_short_arn.py TP4 sweep: 1.03-1.52x vs pf_arn, 1.36-2.83x vs nccl+1cat_norm, 9-14x vs 2stage)
-ARN_CFG = [(256, 3), (1024, 5)]
-AR_CFG = [(128, 3), (192, 5), (256, 3), (1024, 5)]
-# mlp_short.cu (test_short_gemm.py cold-weight sweep: 1.02-1.16x over M=129..448)
-MLP_CFG = [(192, (1, 0)), (256, (3, 1)), (320, (7, 10)), (448, (10, 1))]
-# fp8_short.cu linear (test_short_gemm.py cold-weight sweep: 1.13-2.65x over M=65..512)
-# [(max_M, {(K, N): cfg}, default_cfg)]
+MLP_CFG = [(200, (1, 0)), (256, (3, 1)), (320, (7, 10)), (448, (10, 1))]
 FP8_CFG = [
     (128, {}, 11),
-    (192, {}, 0),
+    (200, {}, 0),
     (256, {(5120, 4096): 11, (5120, 3584): 0}, 1),
     (384, {}, 1),
-    (512, {(5120, 4096): 0, (5120, 3584): 1}, 4),
+    (640, {(5120, 4096): 0, (5120, 3584): 1}, 4),
 ]
-# fp8_short_gated (test_short_gemm.py cold-weight sweep: 1.14-7.04x over M=65..448)
-FP8_GATED_CFG = [(192, 0), (256, 1), (448, 0)]
+FP8_GATED_CFG = [(200, 0), (256, 1), (448, 0)]
 
-_SARN = None
 _SMLP = None
 _SFP8 = None
 
@@ -105,13 +90,6 @@ def _load_spf(name: str, cu_name: str, suffix: str, fast_math: bool = True):
     return load(name=name, sources=[src], build_directory=bdir, extra_cuda_cflags=flags, verbose=False)
 
 
-def short_arn_ext():
-    global _SARN
-    if _SARN is None:
-        _SARN = _load_spf("short_arn_ext", "short_arn.cu", "_short_arn", fast_math=False)
-    return _SARN
-
-
 def mlp_short_ext():
     global _SMLP
     if _SMLP is None:
@@ -132,85 +110,6 @@ def _aligned16(t: torch.Tensor) -> bool:
 
 def _aligned4(t: torch.Tensor) -> bool:
     return (t.data_ptr() & 3) == 0
-
-
-def _sarn_setup(comm) -> None:
-    import torch.distributed as dist
-    X = short_arn_ext()
-    with torch.cuda.device(comm.device):
-        mine = X.alloc_buf()
-        hs = [None] * comm.world_size
-        dist.all_gather_object(hs, X.ipc_handle(mine), group=comm.cpu_group)
-        r = comm.rank_in_group
-        X.init([mine if q == r else X.ipc_open(hs[q]) for q in range(4)], r)
-    comm._q27_sarn = {"maxm": int(X.max_rows()), "arn_calls": 0, "ar_calls": 0}
-    if r == 0:
-        log.warning("q27fuse shortpf: short_arn.cu active (ARN %d..%d, AR %d..%d, %.1f MiB/rank, graph-safe)",
-                    SPF_ARN_MIN, min(SPF_ARN_MAX, int(X.max_rows())),
-                    SPF_AR_MIN, min(SPF_AR_MAX, int(X.max_rows())), X.buf_bytes() / (1 << 20))
-
-
-def apply_arn() -> None:
-    from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator as C
-    if getattr(C, "_q27_sarn_patched", False):
-        return
-    # Ensure pf2.ARN_MIN yields 65..eff_arn_max to short_arn (yielding PK_MIN.. to pf_arn_h32 when Q27_PF_PK=1 & FUSEQ=1)
-    from . import ops, pf2
-    eff_arn_max = SPF_ARN_MAX
-    if ops.PF_PK:
-        from . import pf3
-        if pf3.FUSEQ and pf3.PK_MIN <= eff_arn_max:
-            eff_arn_max = max(SPF_ARN_MIN - 1, pf3.PK_MIN - 1)
-    if SPF_ARN and pf2.ARN_MIN <= eff_arn_max:
-        pf2.ARN_MIN = eff_arn_max + 1
-
-    orig_init = C.__init__
-    orig_arn = C.all_reduce_gemma_rms_norm
-    orig_ar = C.all_reduce
-
-    def __init__(self, *a, **kw):
-        orig_init(self, *a, **kw)
-        self._q27_sarn = None
-        if self.world_size == 4 and "tp" in (self.unique_name or "") and self.device.type == "cuda":
-            _sarn_setup(self)
-
-    def all_reduce_gemma_rms_norm(self, input_, residual, weight, epsilon):
-        st = getattr(self, "_q27_sarn", None)
-        if (SPF_ARN and st is not None and input_.dim() == 2
-                and SPF_ARN_MIN <= input_.shape[0] <= min(eff_arn_max, st["maxm"])
-                and input_.shape[1] == 5120 and input_.dtype == torch.float16
-                and residual.dtype == torch.float32 and weight.dtype == torch.float16
-                and residual.shape == input_.shape and input_.is_contiguous()
-                and residual.is_contiguous() and weight.is_contiguous()
-                and _aligned16(input_) and _aligned16(residual) and _aligned16(weight)):
-            st["arn_calls"] += 1
-            if st["arn_calls"] == 1 and self.rank_in_group == 0:
-                log.warning("q27fuse shortpf: first short_arn (%d rows, capturing=%s)",
-                            input_.shape[0], torch.cuda.is_current_stream_capturing())
-            cfg = _pick(ARN_CFG, int(input_.shape[0]))
-            out, res = short_arn_ext().short_arn(input_, residual, weight, float(epsilon), cfg)
-            return out, res
-        return orig_arn(self, input_, residual, weight, epsilon)
-
-    def all_reduce(self, input_):
-        st = getattr(self, "_q27_sarn", None)
-        if (SPF_AR and st is not None and input_.dim() == 2
-                and SPF_AR_MIN <= input_.shape[0] <= min(SPF_AR_MAX, st["maxm"])
-                and input_.shape[1] == 5120 and input_.dtype == torch.float16
-                and input_.is_contiguous() and _aligned16(input_)):
-            st["ar_calls"] += 1
-            if st["ar_calls"] == 1 and self.rank_in_group == 0:
-                log.warning("q27fuse shortpf: first short_ar (%d rows, capturing=%s)",
-                            input_.shape[0], torch.cuda.is_current_stream_capturing())
-            cfg = _pick(AR_CFG, int(input_.shape[0]))
-            return short_arn_ext().short_ar(input_, cfg)
-        return orig_ar(self, input_)
-
-    C.__init__ = __init__
-    C.all_reduce_gemma_rms_norm = all_reduce_gemma_rms_norm
-    C.sm70_tp4_all_reduce_gemma_rms_norm = all_reduce_gemma_rms_norm
-    C.all_reduce = all_reduce
-    C._q27_sarn_patched = True
 
 
 def apply_mlp() -> None:
@@ -266,7 +165,7 @@ def apply_fp8() -> None:
             xc = x if (x.is_contiguous() and _aligned16(x)) else x.contiguous()
             if (xc.shape[1] == K and K % 32 == 0 and N % 32 == 0 and _aligned16(xc)
                     and scales.numel() == N):
-                if not gated_silu and out.shape[-1] == N:
+                if not gated_silu and out.shape[-1] == N and m <= min(SPF_FP8_MAX, FP8_MAX_BY_KN.get((K, N), 512)):
                     cfg = _pick_fp8(m, K, N)
                     ext.fp8_short(xc, codes.view(-1), scales.view(-1), out, cfg)
                     if (K, N, False) not in seen:
@@ -312,8 +211,6 @@ def _install_preinit():
 
 
 def apply() -> None:
-    if SPF_ARN or SPF_AR:
-        apply_arn()
     if SPF_MLP:
         apply_mlp()
     if SPF_FP8:

@@ -228,13 +228,10 @@ def mlp_prepack(layer, codes: torch.Tensor, scales: torch.Tensor, global_scale_c
         pf3.prepare(layer, codes, scales, g, gated)
 
 
-# >>> [prefill2] Job P / [prefill3]: packed prefill MLP (pf3.py: pk.py + csrc/pk_mlp.cu FOLD mode; format pf_format.py;
-# weights derived from NVFP4 alone or, with Q27_PF_PK_PLANE, from the selection-bit plane encoded from the BF16 originals).
-# Q27_PF_PK=1 (default 0 = off): at load every NVFP4 MLP matrix gets the packed format's arrays (pf3.prepare); prefill rows
-# >= Q27_PF_PK_MIN (default 1024) run quant(x) -> convert -> packed GEMM + SiLU -> quant(h) -> convert -> packed GEMM
-# (pf3.run; per-matrix / per-layer control and quality-emulation modes through Q27_PF_CTL, see pf3.py).
+# Opt-in H_32 packed prefill MLP (pf3.py + pk_h32.py + csrc/pk_h32.cu).
+# Q27_PF_PK=1 (default 0 = off): runs 3-for-2 INT4-(1,256) FOLD HMMA GEMMs with zero-sync Freivalds guard for
+# M >= Q27_PF_PK_MIN (default 1024), using Q27_PF_H32_PLANE=<dir> (1-bit plane) or zero-plane NVFP4 scales if unset.
 PF_PK = int(os.environ.get("Q27_PF_PK", "0") or 0)
-# <<< [prefill2] Job P / [prefill3]
 
 
 def workspace(dev: torch.device, numel: int) -> torch.Tensor:

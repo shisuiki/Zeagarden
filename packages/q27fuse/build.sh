@@ -21,7 +21,7 @@ t0=$(date +%s)
 python3 - <<'PY'
 import time
 import q27fuse
-from q27fuse import ops, attnv, gdnv, smallrows, draftscreen, tail, head, pf2, pk, pk_h32, shortpf, gla
+from q27fuse import ops, attnv, gdnv, smallrows, draftscreen, tail, head, pf2, pk_h32, shortpf, gla
 
 t = time.time()
 print("package:", q27fuse.__file__, flush=True)
@@ -39,9 +39,7 @@ exts = [
     ("tail_ops", tail.ext),
     ("fp8_head", head.ext),
     *pf2.exts(),
-    ("pk_mlp", pk.ext),
     ("pk_h32", pk_h32.ext),
-    ("short_arn", shortpf.short_arn_ext),
     ("mlp_short", shortpf.mlp_short_ext),
     ("fp8_short", shortpf.fp8_short_ext),
     ("attn_gla_mq", gla.gla_ext),

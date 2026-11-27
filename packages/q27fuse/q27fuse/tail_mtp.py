@@ -77,9 +77,16 @@ def apply():
         return
     add_drafter_tag(TAG)
     orig_init = P.__init__
+    orig_fwd = P.forward
+    force_mtp = os.environ.get("Q27_TAIL_MTP_FORCE", "0").strip() == "1"
 
     def __init__(self, *, vllm_config, prefix="", **kw):
         orig_init(self, vllm_config=vllm_config, prefix=prefix, **kw)
+        if getattr(self, "_fc_input_sharded", False) and not force_mtp:
+            self._q27_tail_mtp_skip = True
+            log.warning("q27fuse tail_mtp: skipped on %s (1Cat v1.5.4 native _fc_input_sharded active)", prefix)
+            return
+        self._q27_tail_mtp_skip = False
         quant_config = vllm_config.quant_config
         fc_quant = None if (quant_config and quant_config.get_name() == "modelopt_fp4") else quant_config
         old = self.fc
@@ -93,6 +100,9 @@ def apply():
 
     def forward(self, input_ids, positions, hidden_states, intermediate_tensors=None, inputs_embeds=None,
                 spec_step_idx=0):
+        if getattr(self, "_q27_tail_mtp_skip", False):
+            return orig_fwd(self, input_ids, positions, hidden_states, intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds, spec_step_idx=spec_step_idx)
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)          # masked lookup + all-reduce (fused below)
         assert hidden_states.shape[-1] == inputs_embeds.shape[-1]

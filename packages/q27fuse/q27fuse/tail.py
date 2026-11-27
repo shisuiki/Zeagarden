@@ -459,13 +459,19 @@ def _apply_rows():
     from vllm.model_executor.layers.mamba.gdn import spec_replay as SR
     from vllm.triton_utils import triton
     C = SR.SpecReplayState
+    import inspect
     orig = C.prepare
+    has_dec_param = "decode_ckpt_slots" in inspect.signature(orig).parameters
 
     def prepare(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req, is_prefilling,
-                num_reqs, block_table_ptrs, block_table_stride, mamba_block_size):
+                num_reqs, block_table_ptrs, block_table_stride, mamba_block_size, decode_ckpt_slots=None):
         """SpecReplayState.prepare (1Cat) with the row-table H2D skipped when the tables did not change"""
         if "rows" not in ACTIVE:
             self._q27_last_rows = None
+            if has_dec_param:
+                return orig(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req,
+                            is_prefilling, num_reqs, block_table_ptrs, block_table_stride, mamba_block_size,
+                            decode_ckpt_slots=decode_ckpt_slots)
             return orig(self, idx_mapping, query_start_loc, num_computed_tokens, num_draft_tokens_per_req,
                         is_prefilling, num_reqs, block_table_ptrs, block_table_stride, mamba_block_size)
         if num_reqs == 0:
@@ -486,12 +492,24 @@ def _apply_rows():
             self._rows.copy_(self._rows_host, non_blocking=True)
             self._q27_last_rows = (spec_rows.copy(), plain_rows.copy())
         block = triton.next_power_of_2(max(self.max_rows, 16))
-        SR._prepare_replay_rows_kernel[(2,)](
-            self._rows, idx_mapping, query_start_loc, num_computed_tokens, self.accepted, self.verified, self.side,
-            self.spec_replay, self.spec_map, self.spec_ckpt_token, self.spec_ckpt_slot, self.plain_replay,
-            self.plain_map, block_table_ptrs, block_table_stride, num_spec, num_plain,
-            MAX_ROWS=self.max_rows, NUM_GROUPS=block_table_ptrs.numel(), MAMBA_BLOCK_SIZE=mamba_block_size,
-            BLOCK=block)
+        if has_dec_param:
+            has_decode_ckpt = decode_ckpt_slots is not None and mamba_block_size >= 128
+            SR._prepare_replay_rows_kernel[(2,)](
+                self._rows, idx_mapping, query_start_loc, num_computed_tokens, self.accepted, self.verified, self.side,
+                self.spec_replay, self.spec_map, self.spec_ckpt_token, self.spec_ckpt_slot, self.plain_replay,
+                self.plain_map, block_table_ptrs, block_table_stride,
+                decode_ckpt_slots if has_decode_ckpt else self.spec_ckpt_slot,
+                num_spec, num_plain,
+                MAX_ROWS=self.max_rows, NUM_GROUPS=block_table_ptrs.numel(), MAMBA_BLOCK_SIZE=mamba_block_size,
+                BLOCK=block, HAS_DECODE_CKPT=has_decode_ckpt,
+                DECODE_CKPT_MAX_REQS=(decode_ckpt_slots.shape[1] if decode_ckpt_slots is not None else 0))
+        else:
+            SR._prepare_replay_rows_kernel[(2,)](
+                self._rows, idx_mapping, query_start_loc, num_computed_tokens, self.accepted, self.verified, self.side,
+                self.spec_replay, self.spec_map, self.spec_ckpt_token, self.spec_ckpt_slot, self.plain_replay,
+                self.plain_map, block_table_ptrs, block_table_stride, num_spec, num_plain,
+                MAX_ROWS=self.max_rows, NUM_GROUPS=block_table_ptrs.numel(), MAMBA_BLOCK_SIZE=mamba_block_size,
+                BLOCK=block)
 
     C.prepare = prepare
 
@@ -604,7 +622,9 @@ def _apply_accept():
             if rep is None or rep.accepted.dtype == torch.int32:
                 TM.run_accept(ctx, n, num_sampled, self.num_accepted_tokens_gpu,
                               rep.accepted if rep is not None else None, self._mamba_state_idx_gpu,
-                              num_computed_tokens, idx_mapping)
+                              num_computed_tokens, idx_mapping,
+                              decode_ckpt_slots=getattr(self, "_decode_ckpt_slots_gpu", None),
+                              spec_verified=(rep.verified if rep is not None else None))
                 return
         return orig(self, idx_mapping, num_sampled, num_computed_tokens)
 

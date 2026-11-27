@@ -109,8 +109,10 @@ def _patch_speculator(cfg):
     E = S.EagleSpeculator
     if getattr(E, "_q27_spec_k", False):
         return
+    import inspect
     orig_propose = E.propose
     orig_msd = E.multi_step_decode
+    msd_has_active = "active_spec_steps" in inspect.signature(orig_msd).parameters
 
     def propose(self, input_batch, *args, **kwargs):
         k = k_for(input_batch.num_reqs, self.num_speculative_steps, cfg)
@@ -121,12 +123,17 @@ def _patch_speculator(cfg):
             return self.draft_tokens[: input_batch.num_reqs]
         return orig_propose(self, input_batch, *args, **kwargs)
 
-    def multi_step_decode(self, num_reqs, skip_attn, batch_desc, num_tokens_across_dp):
+    def multi_step_decode(self, num_reqs, skip_attn, batch_desc, num_tokens_across_dp, active_spec_steps=None):
         """1Cat's per-step loop (EagleSpeculator.multi_step_decode without the single K-1-step graph) for k - 1 passes
         (none for k = 0 or 1). num_speculative_steps stays K: the draft buffers and update_eagle_draft_inputs are laid out
         for K."""
         k = getattr(self, "_q27_k", self.num_speculative_steps)
+        if active_spec_steps is not None:
+            k = min(k, int(active_spec_steps))
         if k >= self.num_speculative_steps:
+            if msd_has_active:
+                return orig_msd(self, num_reqs, skip_attn, batch_desc, num_tokens_across_dp,
+                                active_spec_steps=active_spec_steps)
             return orig_msd(self, num_reqs, skip_attn, batch_desc, num_tokens_across_dp)
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]

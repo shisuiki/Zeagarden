@@ -317,10 +317,14 @@ def _install_qkv_splicing():
             @torch.no_grad()
             def prepare_mtp_draft_qpn8(layer):
                 spec = _QKV_SPECS.get(getattr(layer, "prefix", "") or "")
-                if spec is not None and not getattr(layer, MQ._READY, False):
+                ready_nvfp4 = getattr(MQ, "_READY_NVFP4", "_none")
+                if spec is not None and not getattr(layer, MQ._READY, False) and not getattr(layer, ready_nvfp4, False):
                     owner, r_g, kv_ar_pad_cpu = spec
                     w = getattr(layer, "weight", None)
                     if w is not None and w.dtype == torch.float16 and tuple(w.shape) == (3584, 5120):
+                        mark_nvfp4 = getattr(MQ, "_MARK_NVFP4", None)
+                        if mark_nvfp4 and hasattr(layer, mark_nvfp4):
+                            setattr(layer, mark_nvfp4, False)
                         dev = w.device
                         if fuse_qkv:
                             ar_gpu = kv_ar_pad_cpu.to(device=dev, dtype=torch.float16)
@@ -559,6 +563,51 @@ def _make_gla_impl_forward(owner_mod, orig_impl_fwd):
     return gla_impl_forward
 
 
+def _install_hybrid_block_sizing(r_tgt: int, mtp_on: bool) -> None:
+    """Teach vLLM v1.5.4 hybrid Mamba/Attention page alignment about GLA's compressed head size.
+
+    In 1Cat-vLLM v1.5.4, Platform.update_block_size_for_backend computes attention_page_bytes()
+    using model_config.get_head_size() (256 -> 512 B/tok) before Attention.get_kv_cache_spec()
+    runs, which pads GLA's 320 B/tok (u256) or 256 B/tok (u192) pages back up to 512 B/tok.
+    Temporarily overriding get_head_size() -> (r_tgt + 64) // 2 inside that method lets vLLM
+    align Mamba and GLA pages at the true compressed byte width (~0.25% padding vs +60% waste).
+    """
+    try:
+        from vllm.platforms.interface import Platform
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(Platform, "_q27_gla_bs_patched", False):
+        return
+    orig_fn = Platform.update_block_size_for_backend.__func__
+    half_b = (r_tgt + 64) // 2
+
+    @classmethod
+    def _gla_update_block_size(cls, vllm_config):
+        mc = vllm_config.model_config
+        cc = vllm_config.cache_config
+        tc = getattr(mc, "hf_text_config", None)
+        is_q35 = getattr(tc, "model_type", "") == "qwen3_5_text" and getattr(tc, "hidden_size", 0) == 5120
+        has_mtp = vllm_config.speculative_config is not None
+        if not is_q35 or (has_mtp and not mtp_on):
+            return orig_fn(cls, vllm_config)
+
+        orig_get_hs = mc.get_head_size
+        # If SM70 MTP defaults pre-raised block_size=2048 based on 512 B/tok, let update_block_size_for_backend
+        # re-derive the tightest multiple of kernel_block_size for the compressed 320/256 B/tok page width.
+        if not getattr(cc, "user_specified_block_size", False) and (cc.block_size or 0) > 256:
+            cc.block_size = 16
+            if not getattr(cc, "user_specified_mamba_block_size", False):
+                cc.mamba_block_size = None
+        mc.get_head_size = lambda: half_b
+        try:
+            return orig_fn(cls, vllm_config)
+        finally:
+            mc.get_head_size = orig_get_hs
+
+    Platform.update_block_size_for_backend = _gla_update_block_size
+    Platform._q27_gla_bs_patched = True
+
+
 def apply() -> None:
     ckpt_path = _gla_ckpt_path()
     if not ckpt_path:
@@ -578,6 +627,11 @@ def apply() -> None:
     r_tgt = int(ckpt_cpu["layers"][3]["kv_a"][0].shape[0])
     r_mtp = int(ckpt_cpu["mtp0"]["kv_a"][0].shape[0]) if mtp_on else 0
     _tag_aot_cache(f"q27fuse.gla/r{r_tgt}/mtp{r_mtp}/fq{int(_gla_fuse_qkv())}/v2")
+
+    all_ranks = {int(ckpt_cpu["layers"][li]["kv_a"][0].shape[0]) for li in FULL_LAYERS if li in ckpt_cpu["layers"]}
+    if len(ckpt_cpu["layers"]) == len(FULL_LAYERS) and all_ranks == {r_tgt} and r_tgt in (192, 256):
+        if (not mtp_on) or (r_mtp == r_tgt):
+            _install_hybrid_block_sizing(r_tgt, mtp_on)
 
     # Add fused qkv_proj shapes (3328 / 3392) to pf2.FP8_ALGO so long prefill also gets cuBLAS algo 6
     try:

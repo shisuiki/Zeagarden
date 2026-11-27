@@ -14,4 +14,4 @@ q27fuse = "q27fuse:register"
 packages = ["q27fuse"]
 
 [tool.setuptools.package-data]
-q27fuse = ["csrc/*.cu", "csrc/*.cuh", "pk_cfg.json"]
+q27fuse = ["csrc/*.cu", "csrc/*.cuh"]

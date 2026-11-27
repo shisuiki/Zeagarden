@@ -66,6 +66,7 @@ GATED_MAX = int(os.environ.get("Q27_DBG_GATED_MAX", "") or "64")
 GATED_CFG = [(16, "g 2x2 wk4 col1 pr"), (32, "g 4x2 wk4 col1 pr"), (48, "g 3x2 wk4 col1 row2 pr"),
              (64, "g 4x2 wk3 col1 row2 pr")]
 _GIDX = {}
+POST_HOOK = None                                  # [head] debug hook (nandbg.py)
 
 
 def target_table():
@@ -102,7 +103,8 @@ def _gdn_in_ok(layer) -> str | None:
     from vllm.platforms import current_platform
     qz, ba = getattr(layer, "in_proj_qkvz", None), getattr(layer, "in_proj_ba", None)
     if not (getattr(layer, "enable_sm70_dflash2_fused_gdn_verify", False)
-            and getattr(layer, "enable_sm70_gdn_ba_verify", False)):
+            and (getattr(layer, "enable_sm70_gdn_ba_verify", False)
+                 or getattr(layer, "sm70_gdn_ba_verify_native", None) is not None)):
         return "1Cat's fused verify projection is off (no MTP verifier)"
     if not (isinstance(qz, LinearBase) and isinstance(ba, LinearBase) and current_platform.is_device_capability(70)):
         return "projection modules"
@@ -187,6 +189,8 @@ def gated_impl(out: torch.Tensor, x: torch.Tensor, codes: torch.Tensor, scales: 
     else:
         from vllm.model_executor.kernels.linear.qpn.fp8 import dispatch_channel_rows
         dispatch_channel_rows(out, x, codes, scales, split_k, nacc, prefetch, True, native_policy)
+    if POST_HOOK is not None:                     # [head] debug hook (nandbg.py, Q27_NANDBG=1)
+        POST_HOOK("gated", out, x, codes)
 
 
 def gated_fake(out, x, codes, scales, split_k, nacc, prefetch, native_policy=None) -> None:

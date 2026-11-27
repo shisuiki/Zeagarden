@@ -1,4 +1,4 @@
-"""q27fuse - vLLM plugin for serving Qwen3.8-27B-NVFP4 on 4x Tesla V100-SXM2 (sm_70, 1Cat-vLLM v1.5.3).
+"""q27fuse - vLLM plugin for serving Qwen3.8-27B-NVFP4 on 4x Tesla V100-SXM2 (sm_70, 1Cat-vLLM v1.5.3 / v1.5.4).
 
 Master switch:
   Q27_FUSE unset or 0 -> plugin is inert; any non-zero value enables the exact serving stack:
@@ -7,12 +7,12 @@ Master switch:
       (attn_mq.cu, attn_dec.cu), fused GDN decode/verify cores (gdn_core.cu, gdn_verify.cu, gdn_decode.cu),
       rotated 1-bit MTP draft screen (draft_screen.cu), step-tail fusions (tail_ops.cu), and batch-adaptive
       speculative length (Q27_SPEC_K).
-    - Exact prefill (default ON): fused TP4 all-reduce + Gemma norm (pf_arn.cu) + cuBLAS algo 6 FP8 GEMMs
-      for long prefills, and short/agentic prefill kernels (short_arn.cu, mlp_short.cu, fp8_short.cu;
-      Q27_SPF=0 opts out).
+    - Exact prefill (default ON): unified CUDA-graph-safe TP4 all-reduce + Gemma norm (arn.cu, M = 65..4608,
+      Q27_ARN=1), cuBLAS algo 6 FP8 prefill GEMMs (pf_gemm.cu), and short/agentic W4/W8 GEMMs
+      (mlp_short.cu, fp8_short.cu; Q27_SPF=0 opts out).
 
 Opt-in lossy acceleration modes (default OFF):
-  - Packed long prefill (Q27_PF_PK=1 with Q27_PF_H32_PLANE=<dir> or Q27_PF_H32_NV=1):
+  - Packed long prefill (Q27_PF_PK=1, optional Q27_PF_H32_PLANE=<dir> for 1-bit BF16 plane):
       Online H_32 Walsh-Hadamard INT4-(1,256) packed NVFP4 MLP (pk_h32.cu) with zero-sync Freivalds guard.
   - TP4-native GLA-g4 KV compression (Q27_GLA_CKPT=<path>):
       256 B/tok (2.0x) or 320 B/tok (1.6x) FP8 compressed KV with spliced QPN8 qkv_proj and single-read

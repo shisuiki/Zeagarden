@@ -8,8 +8,8 @@
 #   SPEC=mtp4          Enable MTP4 speculative decoding + adaptive Q27_SPEC_K (default: mtp4; set SPEC=none for target-only)
 #   Q27_FUSE=1         Enable q27fuse plugin (default: 1; set 0 for stock 1Cat-vLLM)
 #   Q27_SPF=1          Enable exact short/agentic prefill kernels (default: 1)
-#   Q27_PF_PK=0        Opt-in packed H_32 long prefill (set 1 + Q27_PF_H32_PLANE=<dir> or Q27_PF_H32_NV=1)
-#   Q27_GLA_CKPT=""    Opt-in TP4-native GLA-g4 compressed KV checkpoint (.pt)
+#   Q27_PF_PK=0        Opt-in packed H_32 long prefill (default: 0; optional Q27_PF_H32_PLANE=<dir> for 1-bit plane)
+#   Q27_GLA_CKPT=""    Opt-in TP4-native GLA-g4 compressed KV checkpoint (.safetensors or .pt)
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-${1:-}}"
@@ -42,10 +42,18 @@ ARGS=(
 )
 
 if [[ "$SPEC" =~ ^mtp[1-9]$ ]]; then
-  export Q27_SPEC_K="${Q27_SPEC_K:-4@1,3@2,4@3,3@4,1@16,2@17,1@22}"
+  VLLM_VER="$(python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || true)"
+  if [[ "$VLLM_VER" == 1.5.4* ]]; then
+    export Q27_SPEC_K="${Q27_SPEC_K:-4@1,3@9,1@16,2@17,1@22}"
+    ARGS+=(--no-split-mtp-phase-pure)
+  else
+    export Q27_SPEC_K="${Q27_SPEC_K:-4@1,3@2,4@3,3@4,1@16,2@17,1@22}"
+    ARGS+=(--mixed-prefill-step-latency-ms 0)
+  fi
   ARGS+=(
     --enable-prefix-caching
-    --mixed-prefill-step-latency-ms 0
+    --partial-prefix-cache
+    --mamba-cache-mode align
     --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${SPEC#mtp}}"
   )
   [ -n "${GRAPH_SIZES:-}" ] && ARGS+=(--compilation-config "{\"cudagraph_capture_sizes\": [$GRAPH_SIZES]}")
