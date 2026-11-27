@@ -422,8 +422,10 @@ __host__ __device__ inline int comb_floats(int Sb, int nr) {
 // Deterministic split-KV reduction slice (exact same algorithm as attn_mq_ref.cu, generalized to R_LAT)
 template <int R_LAT, int CT>
 __device__ __forceinline__ void combine_slice(uint8_t* sm, const float* __restrict__ po, const float* __restrict__ pml,
-                                              __half* __restrict__ out, int bh, int SG, int NR, int Sb, int s, int b,
-                                              int h, int Hkv, int Q, float vsc, bool out_aligned4) {
+                                              __half* __restrict__ out, float* __restrict__ lse, int bh, int SG, int NR,
+                                              int Sb, int s, int b, int h, int Hkv, int Q, float vsc,
+                                              bool out_aligned4) {
+  constexpr float LN2 = 0.6931471805599453f;
   constexpr int D4 = R_LAT / 4;
   const int tid = threadIdx.x;
   auto orow = [&](int r) -> size_t { return (((size_t)b * Q + r / NQ) * Hkv + h) * NQ + r % NQ; };
@@ -481,6 +483,10 @@ __device__ __forceinline__ void combine_slice(uint8_t* sm, const float* __restri
     if (j == 0 && r < nrs) {
       Rs[r] = Mz;
       Rs[nrs + r] = (Lt > 0.f) ? (vsc / Lt) : 0.f;
+      const int row_g = rlo + r;
+      if (lse != nullptr && row_g < NR && lo <= row_g * D4) {
+        lse[orow(row_g)] = (Lt > 0.f) ? (Mz + log2f(Lt)) * LN2 : -INFINITY;
+      }
     }
   }
   __syncthreads();
@@ -536,9 +542,9 @@ template <int R_LAT, int RG_SET, int NG, bool FUSED_COMB>
 __global__ void Q27_GLA_LB(NT_SET * NG)
 k_gla(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
       const int* __restrict__ table, int tstride, int tw, const int* __restrict__ lens, __half* __restrict__ out,
-      float* __restrict__ po, float* __restrict__ pml, int* __restrict__ cnt, int Q, int S, int min_tiles, int page,
-      int num_blocks, int64_t kb, int64_t kt, int64_t kh, int64_t vb, int64_t vt, int64_t vh, float sl2, float vsc,
-      bool fast_page, bool kv_aligned16, bool q_aligned16, bool out_aligned4) {
+      float* __restrict__ lse, float* __restrict__ po, float* __restrict__ pml, int* __restrict__ cnt, int Q, int S,
+      int min_tiles, int page, int num_blocks, int64_t kb, int64_t kt, int64_t kh, int64_t vb, int64_t vt, int64_t vh,
+      float sl2, float vsc, bool fast_page, bool kv_aligned16, bool q_aligned16, bool out_aligned4) {
   using C = GLA<R_LAT, RG_SET, NG>;
   constexpr int NT = C::NT;
   constexpr int ROW_B = C::ROW_B;
@@ -585,6 +591,9 @@ k_gla(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_
       for (int i = tid; i < NR * (R_LAT / 2); i += NT) {
         const int row = i / (R_LAT / 2), d2 = (i % (R_LAT / 2)) * 2;
         st_h2_safe(out + orow(row) * R_LAT + d2, z, out_aligned4);
+      }
+      if (lse != nullptr) {
+        for (int r = tid; r < NR; r += NT) lse[orow(r)] = -INFINITY;
       }
     }
     return;
@@ -1017,6 +1026,13 @@ k_gla(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_
         }
       }
     }
+    if (lse != nullptr) {
+      constexpr float LN2 = 0.6931471805599453f;
+      for (int r = tid; r < NR; r += NT) {
+        const float M = MLa[r * 2], L = MLa[r * 2 + 1];
+        lse[orow(r)] = (L > 0.f) ? (M + log2f(L)) * LN2 : -INFINITY;
+      }
+    }
     return;
   }
 
@@ -1071,7 +1087,7 @@ k_gla(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_
     }
     __syncthreads();
 
-    combine_slice<R_LAT, NT>(sm, po, pml, out, bh, SG, NR, Sb, s, b, h, Hkv, Q, vsc, out_aligned4);
+    combine_slice<R_LAT, NT>(sm, po, pml, out, lse, bh, SG, NR, Sb, s, b, h, Hkv, Q, vsc, out_aligned4);
     __syncthreads();
     if (tid == 0 && atom_add_acq_rel_gpu(cnt + bh, 1) == 2 * Sb - 1) st_release_gpu(cnt + bh, 0);
   }
@@ -1081,7 +1097,7 @@ k_gla(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_
 template <int R_LAT, int CT>
 __global__ void __launch_bounds__(CT)
 k_comb(const float* __restrict__ po, const float* __restrict__ pml, const int* __restrict__ lens,
-       __half* __restrict__ out, int Q, int S, int min_tiles, float vsc, bool out_aligned4) {
+       __half* __restrict__ out, float* __restrict__ lse, int Q, int S, int min_tiles, float vsc, bool out_aligned4) {
   extern __shared__ __align__(16) uint8_t sm[];
   const int s = blockIdx.x, h = blockIdx.y, b = blockIdx.z, Hkv = gridDim.y, bh = b * Hkv + h;
   const int* lr = lens + (size_t)b * Q;
@@ -1094,7 +1110,7 @@ k_comb(const float* __restrict__ po, const float* __restrict__ pml, const int* _
   const int T = (Lmax + TILE - 1) / TILE;
   const int Sb = max(1, min(S, T / min_tiles));
   if (Sb == 1 || s >= Sb) return;
-  combine_slice<R_LAT, CT>(sm, po, pml, out, bh, (int)gridDim.x, NQ * Q, Sb, s, b, h, Hkv, Q, vsc, out_aligned4);
+  combine_slice<R_LAT, CT>(sm, po, pml, out, lse, bh, (int)gridDim.x, NQ * Q, Sb, s, b, h, Hkv, Q, vsc, out_aligned4);
 }
 
 // =================================================================================================
@@ -1208,8 +1224,8 @@ inline int plan_splits_dev(int dev, int64_t bh, int64_t S, int64_t R_LAT, int64_
 template <int R_LAT, int RG_SET, int NG>
 void launch_gla(const torch::Tensor& q_cat, const torch::Tensor& k_cache, const torch::Tensor& v_cache,
                 const torch::Tensor& block_table, const torch::Tensor& seq_lens, const torch::Tensor& out_lat,
-                const torch::Tensor& po, const torch::Tensor& pml, const torch::Tensor& cnt, int Q, int S_eff,
-                int min_tiles, int sep, float sl2, float vsc, cudaStream_t st) {
+                float* lse_ptr, const torch::Tensor& po, const torch::Tensor& pml, const torch::Tensor& cnt, int Q,
+                int S_eff, int min_tiles, int sep, float sl2, float vsc, cudaStream_t st) {
   using C = GLA<R_LAT, RG_SET, NG>;
   const int B = (int)block_table.size(0);
   const int num_blocks = (int)k_cache.size(0);
@@ -1245,13 +1261,13 @@ void launch_gla(const torch::Tensor& q_cat, const torch::Tensor& k_cache, const 
   if (sep) {
     k_gla<R_LAT, RG_SET, NG, false><<<grid, C::NT, smem, st>>>(
         q_ptr, kc_ptr, vc_ptr, block_table.data_ptr<int>(), (int)block_table.stride(0), (int)block_table.size(1),
-        seq_lens.data_ptr<int>(), out_ptr, po_ptr, pml_ptr, cnt_ptr, Q, S_eff, min_tiles, page, num_blocks, kb, kt, kh,
-        vb, vt, vh, sl2, vsc, fast_page, kv_aligned16, q_aligned16, out_aligned4);
+        seq_lens.data_ptr<int>(), out_ptr, lse_ptr, po_ptr, pml_ptr, cnt_ptr, Q, S_eff, min_tiles, page, num_blocks,
+        kb, kt, kh, vb, vt, vh, sl2, vsc, fast_page, kv_aligned16, q_aligned16, out_aligned4);
   } else {
     k_gla<R_LAT, RG_SET, NG, true><<<grid, C::NT, smem, st>>>(
         q_ptr, kc_ptr, vc_ptr, block_table.data_ptr<int>(), (int)block_table.stride(0), (int)block_table.size(1),
-        seq_lens.data_ptr<int>(), out_ptr, po_ptr, pml_ptr, cnt_ptr, Q, S_eff, min_tiles, page, num_blocks, kb, kt, kh,
-        vb, vt, vh, sl2, vsc, fast_page, kv_aligned16, q_aligned16, out_aligned4);
+        seq_lens.data_ptr<int>(), out_ptr, lse_ptr, po_ptr, pml_ptr, cnt_ptr, Q, S_eff, min_tiles, page, num_blocks,
+        kb, kt, kh, vb, vt, vh, sl2, vsc, fast_page, kv_aligned16, q_aligned16, out_aligned4);
   }
 
   if (sep && S_eff > 1) {
@@ -1259,31 +1275,31 @@ void launch_gla(const torch::Tensor& q_cat, const torch::Tensor& k_cache, const 
     int cs = 0;
     for (int sb = 2; sb <= S_eff; sb++) cs = std::max(cs, 4 * comb_floats<R_LAT>(sb, nr) + 16);
     TORCH_CHECK(cs <= 96 * 1024, "attn_gla_mq: k_comb SMEM exceeds 96 KiB (", cs, ")");
-    k_comb<R_LAT, CT><<<grid, CT, cs, st>>>(po_ptr, pml_ptr, seq_lens.data_ptr<int>(), out_ptr, Q, S_eff, min_tiles,
-                                            vsc, out_aligned4);
+    k_comb<R_LAT, CT><<<grid, CT, cs, st>>>(po_ptr, pml_ptr, seq_lens.data_ptr<int>(), out_ptr, lse_ptr, Q, S_eff,
+                                            min_tiles, vsc, out_aligned4);
   }
 }
 
 template <int R_LAT>
 void dispatch_cfg(int cfg, const torch::Tensor& q_cat, const torch::Tensor& k_cache, const torch::Tensor& v_cache,
                   const torch::Tensor& block_table, const torch::Tensor& seq_lens, const torch::Tensor& out_lat,
-                  const torch::Tensor& po, const torch::Tensor& pml, const torch::Tensor& cnt, int Q, int S_eff,
-                  int min_tiles, int sep, float sl2, float vsc, cudaStream_t st) {
+                  float* lse_ptr, const torch::Tensor& po, const torch::Tensor& pml, const torch::Tensor& cnt, int Q,
+                  int S_eff, int min_tiles, int sep, float sl2, float vsc, cudaStream_t st) {
   switch (cfg) {
     case 0:
-      launch_gla<R_LAT, 1, 1>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, po, pml, cnt, Q, S_eff,
+      launch_gla<R_LAT, 1, 1>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, lse_ptr, po, pml, cnt, Q, S_eff,
                               min_tiles, sep, sl2, vsc, st);
       return;
     case 1:
-      launch_gla<R_LAT, 1, 2>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, po, pml, cnt, Q, S_eff,
+      launch_gla<R_LAT, 1, 2>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, lse_ptr, po, pml, cnt, Q, S_eff,
                               min_tiles, sep, sl2, vsc, st);
       return;
     case 2:
-      launch_gla<R_LAT, 2, 2>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, po, pml, cnt, Q, S_eff,
+      launch_gla<R_LAT, 2, 2>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, lse_ptr, po, pml, cnt, Q, S_eff,
                               min_tiles, sep, sl2, vsc, st);
       return;
     case 3:
-      launch_gla<R_LAT, 3, 2>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, po, pml, cnt, Q, S_eff,
+      launch_gla<R_LAT, 3, 2>(q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, lse_ptr, po, pml, cnt, Q, S_eff,
                               min_tiles, sep, sl2, vsc, st);
       return;
     default:
@@ -2053,7 +2069,8 @@ void gla_gather_dequant(torch::Tensor k_cache, torch::Tensor v_cache, torch::Ten
 
 void attn_gla_mq(torch::Tensor q_cat, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor block_table,
                  torch::Tensor seq_lens, torch::Tensor out_lat, torch::Tensor po, torch::Tensor pml, torch::Tensor cnt,
-                 double scale, double kv_scale, int64_t Q, int64_t S, int64_t min_tiles, int64_t sep) {
+                 double scale, double kv_scale, int64_t Q, int64_t S, int64_t min_tiles, int64_t sep,
+                 c10::optional<torch::Tensor> lse_out = c10::nullopt) {
   TORCH_CHECK(q_cat.is_cuda(), "attn_gla_mq: q_cat must be a CUDA tensor");
   const auto dev = q_cat.device();
   TORCH_CHECK(k_cache.device() == dev && v_cache.device() == dev && block_table.device() == dev &&
@@ -2087,6 +2104,13 @@ void attn_gla_mq(torch::Tensor q_cat, torch::Tensor k_cache, torch::Tensor v_cac
   TORCH_CHECK(out_lat.dtype() == torch::kHalf && out_lat.is_contiguous() && out_lat.dim() == 3 &&
                   out_lat.size(0) == q_cat.size(0) && out_lat.size(1) == q_cat.size(1) && out_lat.size(2) == R_LAT,
               "attn_gla_mq: out_lat must be [B*Q, 6*Hkv, R_LAT] contiguous fp16");
+  float* lse_ptr = nullptr;
+  if (lse_out.has_value() && lse_out->defined() && lse_out->numel() > 0) {
+    TORCH_CHECK(lse_out->device() == dev && lse_out->dtype() == torch::kFloat && lse_out->is_contiguous() &&
+                    lse_out->dim() == 2 && lse_out->size(0) == q_cat.size(0) && lse_out->size(1) == q_cat.size(1),
+                "attn_gla_mq: lse_out must be [B*Q, 6*Hkv] contiguous fp32 on same device");
+    lse_ptr = lse_out->data_ptr<float>();
+  }
   TORCH_CHECK(min_tiles >= 1, "attn_gla_mq: min_tiles must be >= 1");
   TORCH_CHECK(sep == 0 || sep == 1, "attn_gla_mq: sep must be 0 or 1");
   TORCH_CHECK(std::isfinite(scale) && std::isfinite(kv_scale) && kv_scale > 0.0,
@@ -2127,11 +2151,11 @@ void attn_gla_mq(torch::Tensor q_cat, torch::Tensor k_cache, torch::Tensor v_cac
   const int cfg = cfg_for_q(Q);
 
   if (R_LAT == 192) {
-    dispatch_cfg<192>(cfg, q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, po, pml, cnt, (int)Q, S_eff,
-                      (int)min_tiles, (int)sep, sl2, vsc, st);
+    dispatch_cfg<192>(cfg, q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, lse_ptr, po, pml, cnt, (int)Q,
+                      S_eff, (int)min_tiles, (int)sep, sl2, vsc, st);
   } else {
-    dispatch_cfg<256>(cfg, q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, po, pml, cnt, (int)Q, S_eff,
-                      (int)min_tiles, (int)sep, sl2, vsc, st);
+    dispatch_cfg<256>(cfg, q_cat, k_cache, v_cache, block_table, seq_lens, out_lat, lse_ptr, po, pml, cnt, (int)Q,
+                      S_eff, (int)min_tiles, (int)sep, sl2, vsc, st);
   }
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "attn_gla_mq: kernel launch failed");
 }
@@ -2579,7 +2603,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gla_gather_dequant", &gla_gather_dequant,
         "Gather and dequantize cached GLA tokens across a batch into contiguous fp16/fp32 tensors");
   m.def("attn_gla_mq", &attn_gla_mq,
-        "Single-read shared-latent Volta sm_70 HMMA.884 split-KV absorbed multi-query GLA attention");
+        py::arg("q_cat"), py::arg("k_cache"), py::arg("v_cache"), py::arg("block_table"), py::arg("seq_lens"),
+        py::arg("out_lat"), py::arg("po"), py::arg("pml"), py::arg("cnt"), py::arg("scale"), py::arg("kv_scale"),
+        py::arg("Q"), py::arg("S"), py::arg("min_tiles"), py::arg("sep"), py::arg("lse_out") = c10::nullopt,
+        "Single-read shared-latent Volta sm_70 HMMA.884 split-KV absorbed multi-query GLA attention (+ optional LSE)");
   m.def("gla_splits", &gla_splits, py::arg("bh"), py::arg("S"), py::arg("R_LAT"), py::arg("Q"), py::arg("sep") = 1,
         "Effective split count for (bh, S, R_LAT, Q, sep=1)");
   m.def("gla_workspace", &gla_workspace, py::arg("bh"), py::arg("S"), py::arg("R_LAT"), py::arg("Q"),

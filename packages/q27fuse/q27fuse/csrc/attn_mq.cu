@@ -117,8 +117,9 @@ __device__ __forceinline__ void bar_set(int sg, int nthreads) {
 // in block order (deterministic). sm: comb_floats(Sb, NR) floats of shared memory.
 template <int NT>
 __device__ __forceinline__ void combine_slice(uint8_t* sm, const float* __restrict__ po, const float* __restrict__ pml,
-                                              __half* __restrict__ out, int bh, int SG, int NR, int Sb, int s, int b,
-                                              int h, int Hkv, int Q, float vsc, int stop) {
+                                              __half* __restrict__ out, float* __restrict__ lse, int bh, int SG, int NR,
+                                              int Sb, int s, int b, int h, int Hkv, int Q, float vsc, int stop) {
+  constexpr float LN2 = 0.6931471805599453f;
   const int tid = threadIdx.x;
   auto orow = [&](int r) -> size_t { return (((size_t)b * Q + r / NQ) * Hkv + h) * NQ + r % NQ; };
   const int n4 = NR * HD / 4, lo = (int)((long long)n4 * s / Sb), E = (int)((long long)n4 * (s + 1) / Sb) - lo;
@@ -160,7 +161,14 @@ __device__ __forceinline__ void combine_slice(uint8_t* sm, const float* __restri
     if (r < nrs) for (int k = j; k < Sb; k += 8) Lt += Lk[k * nrs + r] * ex2(Mk[k * nrs + r] - Mz);
 #pragma unroll
     for (int d = 1; d < 8; d <<= 1) Lt += __shfl_xor_sync(0xffffffffu, Lt, d);
-    if (j == 0 && r < nrs) { Rs[r] = Mz; Rs[nrs + r] = Lt > 0.f ? vsc / Lt : 0.f; }
+    if (j == 0 && r < nrs) {
+      Rs[r] = Mz;
+      Rs[nrs + r] = Lt > 0.f ? vsc / Lt : 0.f;
+      const int row_g = rlo + r;
+      if (lse != nullptr && row_g < NR && lo <= row_g * (HD / 4)) {
+        lse[orow(row_g)] = (Lt > 0.f) ? (Mz + log2f(Lt)) * LN2 : -INFINITY;
+      }
+    }
   }
   __syncthreads();
   if (stop == 5) return;                                     // (debug: weights)
@@ -206,9 +214,9 @@ template <int NW, int RG, int NG, int PD, bool RS>
 __global__ void Q27_LB(32 * NW * NG)
 k_mq(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
      const int* __restrict__ table, int tstride, int tw, const int* __restrict__ lens, __half* __restrict__ out,
-     float* __restrict__ po, float* __restrict__ pml, int* __restrict__ cnt, int Q, int S, int min_tiles, int page,
-     long long kb, long long kt, long long kh, long long vb, long long vt, long long vh, float sl2, float vsc,
-     int pf, int sep, int stop) {
+     float* __restrict__ lse, float* __restrict__ po, float* __restrict__ pml, int* __restrict__ cnt, int Q, int S,
+     int min_tiles, int page, long long kb, long long kt, long long kh, long long vb, long long vt, long long vh,
+     float sl2, float vsc, int pf, int sep, int stop) {
   using C = MQ<NW, RG, NG, PD, RS>;
   constexpr int TS = RS ? 1 : NG;                            // tile stride of a set
   constexpr int NT = C::NT, D = C::D, KU = C::KU, DQ = C::DQ, DH = C::DH, NB = C::NB, VW = C::VW, RGW = C::RGW;
@@ -245,9 +253,13 @@ k_mq(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t
   for (int i = 0; i < QMAX; i++)
     if (i < Q) Lmax = max(Lmax, lr[i]);
   if (Lmax <= 0) {                                           // padding request: zeros
-    if (s == 0)
+    if (s == 0) {
       for (int i = tid; i < NR * HD / 2; i += NT)
         reinterpret_cast<__half2*>(out + orow(i / (HD / 2)) * HD)[i % (HD / 2)] = __floats2half2_rn(0.f, 0.f);
+      if (lse != nullptr) {
+        for (int r = tid; r < NR; r += NT) lse[orow(r)] = -INFINITY;
+      }
+    }
     return;
   }
   const int T = (Lmax + TILE - 1) / TILE;
@@ -494,6 +506,13 @@ k_mq(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t
             }
           }
         }
+      if (lse != nullptr) {
+        constexpr float LN2 = 0.6931471805599453f;
+        for (int r = tid; r < NR; r += NT) {
+          const float M = MLa[r * 2], L = MLa[r * 2 + 1];
+          lse[orow(r)] = (L > 0.f) ? (M + log2f(L)) * LN2 : -INFINITY;
+        }
+      }
       return;
     }
     // partial straight from the registers: FP32 numerators relative to the split's row max, (max, sum) per row
@@ -574,6 +593,13 @@ k_mq(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t
         dst[0] = __floats2half2_rn(a.x * f, a.y * f);
         dst[1] = __floats2half2_rn(a.z * f, a.w * f);
       }
+      if (lse != nullptr) {
+        constexpr float LN2 = 0.6931471805599453f;
+        for (int r = tid; r < NR; r += NT) {
+          const float M = RSs[2 * r], L = RSs[2 * r + 1];
+          lse[orow(r)] = (L > 0.f) ? (M + log2f(L)) * LN2 : -INFINITY;
+        }
+      }
       return;
     }
     for (int i = tid; i < NR * HD / 4; i += NT)
@@ -598,7 +624,7 @@ k_mq(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t
   }
   __syncthreads();
   if (stop == 4) return;                                     // (debug: barrier passed)
-  combine_slice<NT>(sm, po, pml, out, bh, (int)gridDim.x, NR, Sb, s, b, h, Hkv, Q, vsc, stop);
+  combine_slice<NT>(sm, po, pml, out, lse, bh, (int)gridDim.x, NR, Sb, s, b, h, Hkv, Q, vsc, stop);
   if (tid == 0 && atomicAdd(cnt + bh, 1) == 2 * Sb - 1) atomicExch(cnt + bh, 0);   // last one out resets
 }
 
@@ -607,7 +633,7 @@ k_mq(const __half* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t
 template <int NT>
 __global__ void __launch_bounds__(NT)
 k_comb(const float* __restrict__ po, const float* __restrict__ pml, const int* __restrict__ lens, __half* __restrict__ out,
-       int Q, int S, int ts_mt, float vsc) {
+       float* __restrict__ lse, int Q, int S, int ts_mt, float vsc) {
   extern __shared__ __align__(16) uint8_t sm[];
   const int s = blockIdx.x, h = blockIdx.y, b = blockIdx.z, Hkv = gridDim.y, bh = b * Hkv + h;
   const int* lr = lens + (size_t)b * Q;
@@ -617,7 +643,7 @@ k_comb(const float* __restrict__ po, const float* __restrict__ pml, const int* _
   const int T = (Lmax + TILE - 1) / TILE;
   const int Sb = max(1, min(S, T / ts_mt));
   if (Sb == 1 || s >= Sb) return;
-  combine_slice<NT>(sm, po, pml, out, bh, (int)gridDim.x, NQ * Q, Sb, s, b, h, Hkv, Q, vsc, 0);
+  combine_slice<NT>(sm, po, pml, out, lse, bh, (int)gridDim.x, NQ * Q, Sb, s, b, h, Hkv, Q, vsc, 0);
 }
 
 int STOP = 0;
@@ -661,6 +687,7 @@ int plan_splits(long long bh, int S, int nr) {
 
 struct Args {
   const torch::Tensor *q, *k, *v, *table, *lens, *out, *po, *pml, *cnt;
+  float* lse;
   int Q, S, min_tiles, pf, sep;
   float sl2, vsc;
   cudaStream_t st;
@@ -681,7 +708,7 @@ void launch(const Args& a) {
   k_mq<NW, RG, NG, PD, RS><<<grid, 32 * NW * NG, smem, a.st>>>(
       reinterpret_cast<const __half*>(a.q->data_ptr<at::Half>()), k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(),
       a.table->data_ptr<int>(), (int)a.table->stride(0), (int)a.table->size(1), a.lens->data_ptr<int>(),
-      reinterpret_cast<__half*>(a.out->data_ptr<at::Half>()), a.po->data_ptr<float>(), a.pml->data_ptr<float>(),
+      reinterpret_cast<__half*>(a.out->data_ptr<at::Half>()), a.lse, a.po->data_ptr<float>(), a.pml->data_ptr<float>(),
       a.cnt->data_ptr<int>(), a.Q, S, a.min_tiles, (int)k.size(1), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
       v.stride(1), v.stride(2), a.sl2, a.vsc, a.pf, a.sep, STOP);
   if (a.sep && S > 1) {
@@ -694,7 +721,7 @@ void launch(const Args& a) {
       attr = true;
     }
     k_comb<CT><<<grid, CT, cs, a.st>>>(a.po->data_ptr<float>(), a.pml->data_ptr<float>(), a.lens->data_ptr<int>(),
-                                        reinterpret_cast<__half*>(a.out->data_ptr<at::Half>()), a.Q, S,
+                                        reinterpret_cast<__half*>(a.out->data_ptr<at::Half>()), a.lse, a.Q, S,
                                         (RS ? 1 : NG) * a.min_tiles, a.vsc);
   }
 }
@@ -753,7 +780,7 @@ std::tuple<int64_t, int64_t> mq_workspace(int64_t bh, int64_t S, int64_t nw, int
 void attn_mq(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor table, torch::Tensor lens,
              torch::Tensor out, torch::Tensor po, torch::Tensor pml, torch::Tensor cnt, double scale, double k_scale,
              double v_scale, int64_t Q, int64_t nw, int64_t S, int64_t min_tiles, int64_t ng, int64_t pd, int64_t pf,
-             int64_t rs, int64_t sep) {
+             int64_t rs, int64_t sep, c10::optional<torch::Tensor> lse_out = c10::nullopt) {
   TORCH_CHECK(q.dtype() == torch::kHalf && q.is_contiguous() && q.dim() == 3 && q.size(2) == HD);
   TORCH_CHECK(k.dtype() == torch::kUInt8 && v.dtype() == torch::kUInt8 && k.dim() == 4 && v.dim() == 4);
   TORCH_CHECK(k.size(3) == HD && k.stride(3) == 1 && v.stride(3) == 1 && k.sizes() == v.sizes());
@@ -763,6 +790,13 @@ void attn_mq(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ta
   TORCH_CHECK(table.dtype() == torch::kInt && table.dim() == 2 && table.stride(1) == 1 && table.size(0) * Q == q.size(0));
   TORCH_CHECK(lens.dtype() == torch::kInt && lens.is_contiguous() && lens.size(0) == q.size(0));
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() && out.dtype() == torch::kHalf);
+  float* lse_ptr = nullptr;
+  if (lse_out.has_value() && lse_out->defined() && lse_out->numel() > 0) {
+    TORCH_CHECK(lse_out->dtype() == torch::kFloat && lse_out->is_contiguous() && lse_out->dim() == 2 &&
+                    lse_out->size(0) == q.size(0) && lse_out->size(1) == q.size(1),
+                "q27 attn_mq: lse_out must be [B*Q, 6*Hkv] contiguous fp32");
+    lse_ptr = lse_out->data_ptr<float>();
+  }
   TORCH_CHECK(min_tiles >= 1);
   const int64_t bh = table.size(0) * k.size(2);
   TORCH_CHECK(mq_splits(bh, S, nw, Q, ng, pd, rs) >= 1, "q27 attn_mq: (nw, row groups, ng, pd, rs) not instantiated");
@@ -772,7 +806,7 @@ void attn_mq(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ta
   if (q.size(0) == 0) return;
   const at::cuda::CUDAGuard g(q.device());
   TORCH_CHECK(pf >= 0 && pf <= 8);
-  Args a{&q, &k, &v, &table, &lens, &out, &po, &pml, &cnt, (int)Q, (int)S, (int)min_tiles, (int)pf, (int)sep,
+  Args a{&q, &k, &v, &table, &lens, &out, &po, &pml, &cnt, lse_ptr, (int)Q, (int)S, (int)min_tiles, (int)pf, (int)sep,
          (float)(scale * k_scale * 256.0 * 1.4426950408889634), (float)(v_scale * 256.0),
          at::cuda::getCurrentCUDAStream()};
   launch_for((int)nw, rg_per_set(Q, ng, rs), (int)ng, (int)pd, (int)rs, a);
@@ -780,7 +814,12 @@ void attn_mq(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ta
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("attn_mq", &attn_mq, "split-KV E4M3 decode attention, Q rows per request, 6 query heads per KV head");
+  m.def("attn_mq", &attn_mq,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("table"), py::arg("lens"), py::arg("out"),
+        py::arg("po"), py::arg("pml"), py::arg("cnt"), py::arg("scale"), py::arg("k_scale"), py::arg("v_scale"),
+        py::arg("Q"), py::arg("nw"), py::arg("S"), py::arg("min_tiles"), py::arg("ng"), py::arg("pd"),
+        py::arg("pf"), py::arg("rs"), py::arg("sep"), py::arg("lse_out") = c10::nullopt,
+        "split-KV E4M3 decode attention, Q rows per request, 6 query heads per KV head (+ optional natural-log LSE)");
   m.def("mq_splits", &mq_splits, "splits a launch uses (bh, S, nw, Q, ng, pd, rs); -1 = not instantiated");
   m.def("mq_workspace", &mq_workspace, "partial workspace floats (po, pml) a launch needs (bh, S, nw, Q, ng, pd, rs)");
   m.def("set_stop", &set_stop, "debug timing: kernels return after phase n (0 = off)");

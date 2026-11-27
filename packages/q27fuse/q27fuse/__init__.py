@@ -34,20 +34,24 @@ def register():
             log.warning("q27fuse: Q27_SPEC_K is set but Q27_FUSE is unset/0; ignored")
         return
     log.info(
-        "q27fuse: enabled (Q27_FUSE=%s, Q27_SPEC_K=%s, Q27_SPF=%s, Q27_PF_PK=%s, Q27_GLA=%s)",
+        "q27fuse: enabled (Q27_FUSE=%s, Q27_SPEC_K=%s, Q27_SPF=%s, Q27_PF_PK=%s, Q27_GLA=%s, Q27_DFLY2=%s)",
         os.environ.get("Q27_FUSE"),
         os.environ.get("Q27_SPEC_K", ""),
         os.environ.get("Q27_SPF", "1"),
         os.environ.get("Q27_PF_PK", "0"),
         bool(os.environ.get("Q27_GLA_CKPT", "").strip()),
+        bool(os.environ.get("Q27_DFLY2_CKPT", "").strip()),
     )
     from . import draftscreen, gdnv, head, patch, spec_k, tail, tail_mtp
 
+    has_dfly2 = bool(os.environ.get("Q27_DFLY2_CKPT", "").strip())
     patch.apply()
     spec_k.apply()
-    draftscreen.apply()
+    if not has_dfly2:
+        draftscreen.apply()
     tail.apply()
-    tail_mtp.apply()
+    if not has_dfly2:
+        tail_mtp.apply()
     head.apply()  # wraps tail's get_top_tokens
     if gdnv.CKPT_FIX and patch._on("Q27_GDNV"):
         gdnv.install_ckpt_fix()
@@ -61,3 +65,8 @@ def register():
         from . import gla
 
         gla.apply()
+
+    if has_dfly2:
+        from . import dfly2
+
+        dfly2.apply()

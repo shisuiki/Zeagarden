@@ -588,7 +588,8 @@ def _install_hybrid_block_sizing(r_tgt: int, mtp_on: bool) -> None:
         tc = getattr(mc, "hf_text_config", None)
         is_q35 = getattr(tc, "model_type", "") == "qwen3_5_text" and getattr(tc, "hidden_size", 0) == 5120
         has_mtp = vllm_config.speculative_config is not None
-        if not is_q35 or (has_mtp and not mtp_on):
+        has_dfly2 = bool(os.environ.get("Q27_DFLY2_CKPT", "").strip())
+        if not is_q35 or (has_mtp and not mtp_on and not has_dfly2):
             return orig_fn(cls, vllm_config)
 
         orig_get_hs = mc.get_head_size
