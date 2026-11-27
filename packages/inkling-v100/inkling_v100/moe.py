@@ -24,6 +24,13 @@ from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
+from .ops.ep4_moe_fused_cuda import (
+    ep4_nvfp4_moe_fused_cuda,
+    is_ep4_moe_fused_eligible,
+    is_ep4_moe_fused_enabled,
+    load_ep4_moe_fused_ext,
+    preallocate_ep4_moe_fused_scratch,
+)
 from .ops.ep4_route_cuda import (
     load_ep4_route_ext,
     preallocate_ep4_route_scratch,
@@ -124,6 +131,14 @@ class Inkling2Sm70Experts(nn.Module):
         self._use_cuda_nvfp4_pf: bool = (
             self.nvfp4 and os.environ.get("INKLING_USE_CUDA_NVFP4_PF", "1") != "0"
         )
+        self._use_ep4_moe_fused: bool = (
+            self.nvfp4
+            and is_ep4_moe_fused_enabled()
+            and self.num_experts == 32
+            and self.hidden_size == 2304
+            and self.intermediate_size == 1152
+            and self.topk == 8
+        )
         self._mx_w13_qpn: torch.Tensor | None = None
         self._mx_s13_qpn: torch.Tensor | None = None
         self._mx_g13: torch.Tensor | None = None
@@ -175,6 +190,9 @@ class Inkling2Sm70Experts(nn.Module):
                 e_local=self.num_experts,
                 topk=self.topk,
             )
+        if self._use_ep4_moe_fused:
+            load_ep4_moe_fused_ext()
+            preallocate_ep4_moe_fused_scratch(self.w13_weight.device)
         if not self.nvfp4:
             if self._use_cuda_mxfp8:
                 load_mxfp8_moe_ext()
@@ -359,6 +377,21 @@ class Inkling2MoE(nn.Module):
         self.experts = Inkling2Sm70Experts(config, quant_format)
         self._use_cuda_route = os.environ.get("INKLING_USE_CUDA_ROUTE", "1") != "0"
 
+    def can_use_fused_m8(self, x: torch.Tensor) -> bool:
+        return (
+            self.experts._use_ep4_moe_fused
+            and self.experts._g13_t is not None
+            and self.experts._g2_t is not None
+            and is_ep4_moe_fused_eligible(
+                x,
+                self.gate.weight,
+                self.experts.w13_weight.data,
+                self.experts.w2_weight.data,
+                self.experts.expert_lo,
+                self.experts.expert_hi,
+            )
+        )
+
     def _forward_chunk(
         self,
         x: torch.Tensor,
@@ -366,6 +399,28 @@ class Inkling2MoE(nn.Module):
         reduce: bool,
         return_unreduced_pair: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if not return_unreduced_pair and self.can_use_fused_m8(x):
+            assert self.experts._g13_t is not None and self.experts._g2_t is not None
+            out = ep4_nvfp4_moe_fused_cuda(
+                x,
+                self.gate.weight,
+                self.gate.bias,
+                self.experts.w13_weight.data,
+                self.experts.w13_weight_scale.data.view(torch.uint8),
+                self.experts._g13_t,
+                self.experts.w2_weight.data,
+                self.experts.w2_weight_scale.data.view(torch.uint8),
+                self.experts._g2_t,
+                self.gate.route_scale,
+                self.experts.gate_cap,
+                self.experts.up_cap,
+                self.experts.expert_lo,
+                self.experts.expert_hi,
+                is_padding=is_padding,
+            )
+            if not reduce or self.experts.ep_size == 1:
+                return out
+            return tensor_model_parallel_all_reduce(out)
         if self._use_cuda_route:
             ids, weights, src2dst, perm, gids, goff = select_and_route_ep4_cuda(
                 x,

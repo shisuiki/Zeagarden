@@ -119,9 +119,20 @@ struct Args {
   // Output: [Q, T, H] fp16 (APPLY_NORM) or fp32 (!APPLY_NORM)
   void* out;
   int T;
+  int rehearse;
 };
 
 // ----------------------------------------------------------------------------- PTX helpers
+__device__ __forceinline__ void prefetch_l2(const void* p) {
+  asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+
+__device__ __forceinline__ float shfl_bfly_f32(float v, int o) {
+  float r;
+  asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(r) : "f"(v), "r"(o));
+  return r;
+}
+
 __device__ __forceinline__ unsigned long long gtime() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -244,7 +255,7 @@ __device__ __forceinline__ void store_f32_8(float* p, const float (&f)[8]) {
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-  for (int o = 16; o; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
+  for (int o = 16; o; o >>= 1) v = __fadd_rn(v, shfl_bfly_f32(v, o));
   return v;
 }
 
@@ -281,6 +292,7 @@ k_ar_conv_mix(Args a) {
   __shared__ int s_qstart;
   __shared__ int s_blk[W_CONV];
   __shared__ int s_row_mode[W_CONV];  // 0=zero, 1=cur_reg, 2=intra_ar_tmp, 3=cache
+  __shared__ int s_need_rehearse;
 
   const int t = blockIdx.x;
   const int tid = threadIdx.x;
@@ -321,7 +333,7 @@ k_ar_conv_mix(Args a) {
     my_v = __ldcs(reinterpret_cast<const uint4*>(a.x + (size_t)t * H + col));
   }
 
-  // Push my_v to all 3 peers' recv[slot][peer_slot][t]
+  // Push my_v to all 3 peers' recv[slot][peer_slot][t] BEFORE anything else
 #pragma unroll
   for (int i = 1; i < NRK; i++) {
     const int q = (r + i) & (NRK - 1);
@@ -330,6 +342,10 @@ k_ar_conv_mix(Args a) {
     *reinterpret_cast<uint4*>(dst) = my_v;
   }
   __syncthreads();
+  const uint64_t* const f_base = flag_of(a.c, r, slot);
+  const uint64_t* const f_p1 = f_base + (size_t)((r + 1) & 3) * MAX_T + t;
+  const uint64_t* const f_p2 = f_base + (size_t)((r + 2) & 3) * MAX_T + t;
+  const uint64_t* const f_p3 = f_base + (size_t)((r + 3) & 3) * MAX_T + t;
   if (tid == 0) {
     fence_sys();
 #pragma unroll
@@ -337,7 +353,7 @@ k_ar_conv_mix(Args a) {
       const int q = (r + i) & (NRK - 1);
       st_rlx_sys_u64(flag_of(a.c, q, slot) + (size_t)r * MAX_T + t, ep);
     }
-    // Also precompute conv tap block table lookups while waiting on NVLink!
+    // Precompute conv tap block table lookups while peers' pushes are in flight!
     const bool valid = s_slot_m >= 0;
     const int32_t* bt_row = a.block_table + (int64_t)s_req * a.stride_bt;
     for (int k = 0; k < W_CONV; k++) {
@@ -360,193 +376,168 @@ k_ar_conv_mix(Args a) {
         s_blk[k] = bt_row[lblk];
       }
     }
-    // Wait for all 3 peers' pushes for token t
-    const uint64_t* f = flag_of(a.c, r, slot);
-    wait_flag3_u64(
-        f + (size_t)((r + 1) & 3) * MAX_T + t,
-        f + (size_t)((r + 2) & 3) * MAX_T + t,
-        f + (size_t)((r + 3) & 3) * MAX_T + t,
-        ep);
+    // Check if peers have already arrived; only run the I-cache warmup pass when peers are in flight!
+    const bool ready_now =
+        (ld_rlx_sys_u64(f_p1) == ep && ld_rlx_sys_u64(f_p2) == ep && ld_rlx_sys_u64(f_p3) == ep);
+    s_need_rehearse = (a.rehearse && !ready_now) ? 1 : 0;
   }
   __syncthreads();
 
-  // ---------------- Step 2: Rank-order 0..3 FP32 AllReduce -> FP16 cur_h
-  const __half* const rv = recv_of(a.c, r, slot);
-  float cur_f[8];
-#pragma unroll
-  for (int p = 0; p < NRK; p++) {
-    const uint4 pv = (p == r) ? my_v : ldcg4(rv + ((size_t)slot_idx(p, r) * MAX_T + t) * H + col);
-    float pf[8];
-    unpack8(pv, pf);
-#pragma unroll
-    for (int e = 0; e < 8; e++) cur_f[e] = (p == 0) ? pf[e] : __fadd_rn(cur_f[e], pf[e]);
-  }
-  const uint4 cur_h = pack8(cur_f);
-  // Exact FP16-rounded cur_f matching `_conv` (`cur = x.to(dtype); ... + cur.to(fp32)`):
-  unpack8(cur_h, cur_f);
-
-  // If intra-batch Q > 1 might be present (t > s_qstart or t + 1 < T), publish cur_h to ar_tmp[t].
-  // Note: At Q = 1 decode, s_qstart == t for every token; publishing only when T > 1 avoids extra store at T=1.
-  if (a.T > 1) {
-    *reinterpret_cast<uint4*>(a.scratch->ar_tmp + (size_t)t * H + col) = cur_h;
-    __syncthreads();
-    if (tid == 0) {
-      fence_gpu();
-      st_rel_gpu_u64(&a.scratch->ar_ready[t], ep);
-    }
-  }
-
-  // ---------------- Step 3: Fused W=4 Short Conv + Cache Write + Residual/Addend -> FP32 conv_out
+  // Pull independent conv/residual/stack/query weights & cache lines toward L2 during NVLink flight!
   const int ch = col / a.stream_width;  // 0 or 1 (since stream_width == 1152 == 144*8)
   const int c_in_h = a.stream_offset + (col - ch * a.stream_width);
   const int64_t slot_m = s_slot_m;
-  if (slot_m >= 0) {
-    const int64_t blk = slot_m / a.cache_N;
-    const int64_t off_n = slot_m % a.cache_N;
-    __half* cdst = a.cache + blk * a.stride_c_blk + (int64_t)ch * a.stride_c_h + off_n * a.stride_c_n + c_in_h;
-    *reinterpret_cast<uint4*>(cdst) = cur_h;
-  }
-
-  // Load static conv weights [col..col+7, 0..3] packed as 4 uint4 (16 regs instead of 32 floats)
-  const uint4* w_ptr = reinterpret_cast<const uint4*>(a.conv_weight + (size_t)col * W_CONV);
-  const uint4 wv0 = __ldg(w_ptr + 0);
-  const uint4 wv1 = __ldg(w_ptr + 1);
-  const uint4 wv2 = __ldg(w_ptr + 2);
-  const uint4 wv3 = __ldg(w_ptr + 3);
-  const __half* wh0 = reinterpret_cast<const __half*>(&wv0);
-  const __half* wh1 = reinterpret_cast<const __half*>(&wv1);
-  const __half* wh2 = reinterpret_cast<const __half*>(&wv2);
-  const __half* wh3 = reinterpret_cast<const __half*>(&wv3);
-
-  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   const int64_t pos = s_pos;
+  const uint4* w_ptr = reinterpret_cast<const uint4*>(a.conv_weight + (size_t)col * W_CONV);
+  prefetch_l2(w_ptr);
+  prefetch_l2(w_ptr + 2);
+  if constexpr (HAS_ADDEND) prefetch_l2(a.addend + (size_t)t * H + col);
+  if constexpr (HAS_RES) prefetch_l2(a.residual + (size_t)t * H + col);
+  if constexpr (HAS_LAST) prefetch_l2(a.last + (size_t)t * H + col);
+  for (int n = 0; n < a.n_stack; n++) {
+    prefetch_l2(a.stack + (int64_t)n * a.stride_s + (size_t)t * H + col);
+  }
 #pragma unroll
-  for (int k = 0; k < W_CONV; k++) {
-    const int mode = s_row_mode[k];
-    if (mode == 0) continue;
-    float xt[8];
-    if (mode == 1) {
+  for (int q = 0; q < Q_C; q++) {
+    prefetch_l2(a.queries + (size_t)q * H + col);
+    if constexpr (APPLY_NORM) prefetch_l2(a.norm_w + (size_t)q * H + col);
+  }
 #pragma unroll
-      for (int e = 0; e < 8; e++) xt[e] = cur_f[e];
-    } else if (mode == 2) {
-      const int src_row = s_blk[k];
-      if (tid == 0) wait_local_u64(&a.scratch->ar_ready[src_row], ep);
-      __syncthreads();
-      const uint4 tv = ldcg4(a.scratch->ar_tmp + (size_t)src_row * H + col);
-      unpack8(tv, xt);
-    } else {
+  for (int k = 0; k < W_CONV - 1; k++) {
+    if (s_row_mode[k] == 3) {
       const int lag = (W_CONV - 1) - k;
       const int64_t src_pos = pos - lag;
       const int64_t blk = (int64_t)s_blk[k];
       const int64_t off_n = src_pos % a.cache_N;
-      const __half* csrc =
-          a.cache + blk * a.stride_c_blk + (int64_t)ch * a.stride_c_h + off_n * a.stride_c_n + c_in_h;
-      const uint4 tv = __ldg(reinterpret_cast<const uint4*>(csrc));
-      unpack8(tv, xt);
+      prefetch_l2(a.cache + blk * a.stride_c_blk + (int64_t)ch * a.stride_c_h + off_n * a.stride_c_n + c_in_h);
     }
-    acc[0] = __fmaf_rn(xt[0], __half2float(wh0[k]), acc[0]);
-    acc[1] = __fmaf_rn(xt[1], __half2float(wh0[4 + k]), acc[1]);
-    acc[2] = __fmaf_rn(xt[2], __half2float(wh1[k]), acc[2]);
-    acc[3] = __fmaf_rn(xt[3], __half2float(wh1[4 + k]), acc[3]);
-    acc[4] = __fmaf_rn(xt[4], __half2float(wh2[k]), acc[4]);
-    acc[5] = __fmaf_rn(xt[5], __half2float(wh2[4 + k]), acc[5]);
-    acc[6] = __fmaf_rn(xt[6], __half2float(wh3[k]), acc[6]);
-    acc[7] = __fmaf_rn(xt[7], __half2float(wh3[4 + k]), acc[7]);
   }
 
-  float y[8];
+  // Pass 0 (optional, ONLY when peers are late): warm SM I-cache on local partial with all stores off.
+  // Pass 1 (always): wait for peers, reduce in exact rank order 0..3, run conv + AttnRes + norm, store.
+  const __half* const rv = recv_of(a.c, r, slot);
+#pragma unroll 1
+  for (int pass = s_need_rehearse ? 0 : 1; pass < 2; pass++) {
+    // ---------------- Step 2: Rank-order 0..3 FP32 AllReduce -> FP16 cur_h
+    uint4 cur_h = my_v;
+    float cur_f[8];
+    if (pass) {
+      if (tid == 0) {
+        wait_flag3_u64(f_p1, f_p2, f_p3, ep);
+      }
+      __syncthreads();
 #pragma unroll
-  for (int e = 0; e < 8; e++) y[e] = __fmul_rn(__fadd_rn(acc[e], cur_f[e]), a.conv_scale);
-
-  if constexpr (HAS_ADDEND) {
-    float ad[8];
-    load_f32_8(a.addend + (size_t)t * H + col, ad);
-    if constexpr (HAS_RES) {
-      float rs[8];
-      load_f32_8(a.residual + (size_t)t * H + col, rs);
+      for (int p = 0; p < NRK; p++) {
+        const uint4 pv = (p == r) ? my_v : ldcg4(rv + ((size_t)slot_idx(p, r) * MAX_T + t) * H + col);
+        float pf[8];
+        unpack8(pv, pf);
 #pragma unroll
-      for (int e = 0; e < 8; e++) ad[e] = __fadd_rn(rs[e], ad[e]);
+        for (int e = 0; e < 8; e++) cur_f[e] = (p == 0) ? pf[e] : __fadd_rn(cur_f[e], pf[e]);
+      }
+      cur_h = pack8(cur_f);
     }
-#pragma unroll
-    for (int e = 0; e < 8; e++) y[e] = __fadd_rn(ad[e], y[e]);
-  }
-  store_f32_8(a.conv_out + (size_t)t * H + col, y);
+    // Exact FP16-rounded cur_f matching `_conv` (`cur = x.to(dtype); ... + cur.to(fp32)`):
+    unpack8(cur_h, cur_f);
 
-  // ---------------- Step 4: Fused AttnRes Mix + Optional FP16 RMSNorm (y still in registers!)
-  // Prepare last_src = (HAS_LAST ? last + y : y)
-  float last_src[8];
-  if constexpr (HAS_LAST) {
-    float lf[8];
-    load_f32_8(a.last + (size_t)t * H + col, lf);
-#pragma unroll
-    for (int e = 0; e < 8; e++) last_src[e] = __fadd_rn(lf[e], y[e]);
-  } else {
-#pragma unroll
-    for (int e = 0; e < 8; e++) last_src[e] = y[e];
-  }
+    // If intra-batch Q > 1 might be present (t > s_qstart or t + 1 < T), publish cur_h to ar_tmp[t].
+    if (pass && a.T > 1) {
+      *reinterpret_cast<uint4*>(a.scratch->ar_tmp + (size_t)t * H + col) = cur_h;
+      __syncthreads();
+      if (tid == 0) {
+        fence_gpu();
+        st_rel_gpu_u64(&a.scratch->ar_ready[t], ep);
+      }
+    }
 
-  const int n_stack = a.n_stack;
-  const int n_tot = n_stack + 1;
-  const float inv_H = 1.0f / (float)H;
-  int rbuf = 0;
+    // ---------------- Step 3: Fused W=4 Short Conv + Cache Write + Residual/Addend -> FP32 conv_out
+    if (pass && slot_m >= 0) {
+      const int64_t blk = slot_m / a.cache_N;
+      const int64_t off_n = slot_m % a.cache_N;
+      __half* cdst = a.cache + blk * a.stride_c_blk + (int64_t)ch * a.stride_c_h + off_n * a.stride_c_n + c_in_h;
+      *reinterpret_cast<uint4*>(cdst) = cur_h;
+    }
 
-  // Pass 1: compute rstd[n] (shared across Q_C) and dot(q, x_n) in ONE barrier per n!
-  for (int n = 0; n < n_tot; n++) {
-    float xn[8];
-    if (n < n_stack) {
-      load_f32_8(a.stack + (int64_t)n * a.stride_s + (size_t)t * H + col, xn);
+    // Load static conv weights [col..col+7, 0..3] packed as 4 uint4 (16 regs instead of 32 floats)
+    const uint4 wv0 = __ldg(w_ptr + 0);
+    const uint4 wv1 = __ldg(w_ptr + 1);
+    const uint4 wv2 = __ldg(w_ptr + 2);
+    const uint4 wv3 = __ldg(w_ptr + 3);
+    const __half* wh0 = reinterpret_cast<const __half*>(&wv0);
+    const __half* wh1 = reinterpret_cast<const __half*>(&wv1);
+    const __half* wh2 = reinterpret_cast<const __half*>(&wv2);
+    const __half* wh3 = reinterpret_cast<const __half*>(&wv3);
+
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int k = 0; k < W_CONV; k++) {
+      const int mode = s_row_mode[k];
+      if (mode == 0) continue;
+      float xt[8];
+      if (mode == 1 || (!pass && mode == 2)) {
+#pragma unroll
+        for (int e = 0; e < 8; e++) xt[e] = cur_f[e];
+      } else if (mode == 2) {
+        const int src_row = s_blk[k];
+        if (tid == 0) wait_local_u64(&a.scratch->ar_ready[src_row], ep);
+        __syncthreads();
+        const uint4 tv = ldcg4(a.scratch->ar_tmp + (size_t)src_row * H + col);
+        unpack8(tv, xt);
+      } else {
+        const int lag = (W_CONV - 1) - k;
+        const int64_t src_pos = pos - lag;
+        const int64_t blk = (int64_t)s_blk[k];
+        const int64_t off_n = src_pos % a.cache_N;
+        const __half* csrc =
+            a.cache + blk * a.stride_c_blk + (int64_t)ch * a.stride_c_h + off_n * a.stride_c_n + c_in_h;
+        const uint4 tv = __ldg(reinterpret_cast<const uint4*>(csrc));
+        unpack8(tv, xt);
+      }
+      acc[0] = __fmaf_rn(xt[0], __half2float(wh0[k]), acc[0]);
+      acc[1] = __fmaf_rn(xt[1], __half2float(wh0[4 + k]), acc[1]);
+      acc[2] = __fmaf_rn(xt[2], __half2float(wh1[k]), acc[2]);
+      acc[3] = __fmaf_rn(xt[3], __half2float(wh1[4 + k]), acc[3]);
+      acc[4] = __fmaf_rn(xt[4], __half2float(wh2[k]), acc[4]);
+      acc[5] = __fmaf_rn(xt[5], __half2float(wh2[4 + k]), acc[5]);
+      acc[6] = __fmaf_rn(xt[6], __half2float(wh3[k]), acc[6]);
+      acc[7] = __fmaf_rn(xt[7], __half2float(wh3[4 + k]), acc[7]);
+    }
+
+    float y[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) y[e] = __fmul_rn(__fadd_rn(acc[e], cur_f[e]), a.conv_scale);
+
+    if constexpr (HAS_ADDEND) {
+      float ad[8];
+      load_f32_8(a.addend + (size_t)t * H + col, ad);
+      if constexpr (HAS_RES) {
+        float rs[8];
+        load_f32_8(a.residual + (size_t)t * H + col, rs);
+#pragma unroll
+        for (int e = 0; e < 8; e++) ad[e] = __fadd_rn(rs[e], ad[e]);
+      }
+#pragma unroll
+      for (int e = 0; e < 8; e++) y[e] = __fadd_rn(ad[e], y[e]);
+    }
+    if (pass) store_f32_8(a.conv_out + (size_t)t * H + col, y);
+
+    // ---------------- Step 4: Fused AttnRes Mix + Optional FP16 RMSNorm (y still in registers!)
+    float last_src[8];
+    if constexpr (HAS_LAST) {
+      float lf[8];
+      load_f32_8(a.last + (size_t)t * H + col, lf);
+#pragma unroll
+      for (int e = 0; e < 8; e++) last_src[e] = __fadd_rn(lf[e], y[e]);
     } else {
 #pragma unroll
-      for (int e = 0; e < 8; e++) xn[e] = last_src[e];
+      for (int e = 0; e < 8; e++) last_src[e] = y[e];
     }
-    float sums[Q_C + 1];
-    float ss = __fmul_rn(xn[0], xn[0]);
-#pragma unroll
-    for (int e = 1; e < 8; e++) ss = __fmaf_rn(xn[e], xn[e], ss);
-    sums[0] = ss;
-#pragma unroll
-    for (int q = 0; q < Q_C; q++) {
-      float qf[8];
-      load_f32_8(a.queries + (size_t)q * H + col, qf);
-      float dt = __fmul_rn(qf[0], xn[0]);
-#pragma unroll
-      for (int e = 1; e < 8; e++) dt = __fmaf_rn(qf[e], xn[e], dt);
-      sums[1 + q] = dt;
-    }
-    block_sum_m<Q_C + 1>(sums, lane, warp, rbuf, red);
-    rbuf ^= 1;
-    if (tid == 0) {
-      const float rstd = rsqrtf(__fmaf_rn(sums[0], inv_H, a.eps));
-      s_inv_rms[n] = rstd;
-#pragma unroll
-      for (int q = 0; q < Q_C; q++) {
-        s_logits[q][n] = __fmul_rn(sums[1 + q], rstd);
-      }
-    }
-  }
-  if (tid == 0) {
-#pragma unroll
-    for (int q = 0; q < Q_C; q++) {
-      float mx = s_logits[q][0];
-      for (int n = 1; n < n_tot; n++) mx = fmaxf(mx, s_logits[q][n]);
-      float psum = 0.0f;
-      for (int n = 0; n < n_tot; n++) {
-        const float pv = expf(s_logits[q][n] - mx);
-        s_probs[q][n] = pv;
-        psum = __fadd_rn(psum, pv);
-      }
-      const float inv_sum = __fdiv_rn(1.0f, psum);
-      for (int n = 0; n < n_tot; n++) {
-        s_probs[q][n] = __fmul_rn(__fmul_rn(s_probs[q][n], s_inv_rms[n]), inv_sum);
-      }
-    }
-  }
-  __syncthreads();
 
-  // Pass 2: weighted mix + optional RMSNorm per query q in 0..Q_C-1
-#pragma unroll
-  for (int q = 0; q < Q_C; q++) {
-    float mix[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const int n_stack = a.n_stack;
+    const int n_tot = n_stack + 1;
+    const float inv_H = 1.0f / (float)H;
+    int rbuf = 0;
+
+    // Pass 1: compute rstd[n] (shared across Q_C) and dot(q, x_n) in ONE barrier per n!
     for (int n = 0; n < n_tot; n++) {
       float xn[8];
       if (n < n_stack) {
@@ -555,30 +546,88 @@ k_ar_conv_mix(Args a) {
 #pragma unroll
         for (int e = 0; e < 8; e++) xn[e] = last_src[e];
       }
-      const float pn = s_probs[q][n];
+      float sums[Q_C + 1];
+      float ss = __fmul_rn(xn[0], xn[0]);
 #pragma unroll
-      for (int e = 0; e < 8; e++) mix[e] = __fmaf_rn(pn, xn[e], mix[e]);
-    }
-
-    const size_t out_off = ((size_t)q * a.T + t) * H + col;
-    if constexpr (APPLY_NORM) {
-      float s1[1];
-      float ss = __fmul_rn(mix[0], mix[0]);
+      for (int e = 1; e < 8; e++) ss = __fmaf_rn(xn[e], xn[e], ss);
+      sums[0] = ss;
 #pragma unroll
-      for (int e = 1; e < 8; e++) ss = __fmaf_rn(mix[e], mix[e], ss);
-      s1[0] = ss;
-      block_sum_m<1>(s1, lane, warp, rbuf, red);
+      for (int q = 0; q < Q_C; q++) {
+        float qf[8];
+        load_f32_8(a.queries + (size_t)q * H + col, qf);
+        float dt = __fmul_rn(qf[0], xn[0]);
+#pragma unroll
+        for (int e = 1; e < 8; e++) dt = __fmaf_rn(qf[e], xn[e], dt);
+        sums[1 + q] = dt;
+      }
+      block_sum_m<Q_C + 1>(sums, lane, warp, rbuf, red);
       rbuf ^= 1;
-      const float out_rstd = rsqrtf(__fadd_rn(__fdiv_rn(s1[0], (float)H), a.norm_eps));
-      const uint4 wv = __ldg(reinterpret_cast<const uint4*>(a.norm_w + (size_t)q * H + col));
-      float wf[8];
-      unpack8(wv, wf);
+      if (tid == 0) {
+        const float rstd = rsqrtf(__fmaf_rn(sums[0], inv_H, a.eps));
+        s_inv_rms[n] = rstd;
 #pragma unroll
-      for (int e = 0; e < 8; e++) mix[e] = __fmul_rn(__fmul_rn(mix[e], out_rstd), wf[e]);
-      *reinterpret_cast<uint4*>(static_cast<__half*>(a.out) + out_off) = pack8(mix);
-    } else {
-      store_f32_8(static_cast<float*>(a.out) + out_off, mix);
+        for (int q = 0; q < Q_C; q++) {
+          s_logits[q][n] = __fmul_rn(sums[1 + q], rstd);
+        }
+      }
     }
+    if (tid == 0) {
+#pragma unroll
+      for (int q = 0; q < Q_C; q++) {
+        float mx = s_logits[q][0];
+        for (int n = 1; n < n_tot; n++) mx = fmaxf(mx, s_logits[q][n]);
+        float psum = 0.0f;
+        for (int n = 0; n < n_tot; n++) {
+          const float pv = expf(s_logits[q][n] - mx);
+          s_probs[q][n] = pv;
+          psum = __fadd_rn(psum, pv);
+        }
+        const float inv_sum = __fdiv_rn(1.0f, psum);
+        for (int n = 0; n < n_tot; n++) {
+          s_probs[q][n] = __fmul_rn(__fmul_rn(s_probs[q][n], s_inv_rms[n]), inv_sum);
+        }
+      }
+    }
+    __syncthreads();
+
+    // Pass 2: weighted mix + optional RMSNorm per query q in 0..Q_C-1
+#pragma unroll
+    for (int q = 0; q < Q_C; q++) {
+      float mix[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      for (int n = 0; n < n_tot; n++) {
+        float xn[8];
+        if (n < n_stack) {
+          load_f32_8(a.stack + (int64_t)n * a.stride_s + (size_t)t * H + col, xn);
+        } else {
+#pragma unroll
+          for (int e = 0; e < 8; e++) xn[e] = last_src[e];
+        }
+        const float pn = s_probs[q][n];
+#pragma unroll
+        for (int e = 0; e < 8; e++) mix[e] = __fmaf_rn(pn, xn[e], mix[e]);
+      }
+
+      const size_t out_off = ((size_t)q * a.T + t) * H + col;
+      if constexpr (APPLY_NORM) {
+        float s1[1];
+        float ss = __fmul_rn(mix[0], mix[0]);
+#pragma unroll
+        for (int e = 1; e < 8; e++) ss = __fmaf_rn(mix[e], mix[e], ss);
+        s1[0] = ss;
+        block_sum_m<1>(s1, lane, warp, rbuf, red);
+        rbuf ^= 1;
+        const float out_rstd = rsqrtf(__fadd_rn(__fdiv_rn(s1[0], (float)H), a.norm_eps));
+        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(a.norm_w + (size_t)q * H + col));
+        float wf[8];
+        unpack8(wv, wf);
+#pragma unroll
+        for (int e = 0; e < 8; e++) mix[e] = __fmul_rn(__fmul_rn(mix[e], out_rstd), wf[e]);
+        if (pass) *reinterpret_cast<uint4*>(static_cast<__half*>(a.out) + out_off) = pack8(mix);
+      } else {
+        if (pass) store_f32_8(static_cast<float*>(a.out) + out_off, mix);
+      }
+    }
+    if (!pass) __syncthreads();
   }
 
   // ---------------- Step 5: Advance device-side monotonic epoch on strictly last CTA
@@ -634,6 +683,14 @@ void probe_all() {
   probe_kernel("moe_res1_q1_norm0", k_ar_conv_mix<true, true, true, false, false, 1>);
   probe_kernel("moe_res0_q3_norm0", k_ar_conv_mix<true, true, false, false, false, 3>);
   probe_kernel("moe_res1_q3_norm0", k_ar_conv_mix<true, true, true, false, false, 3>);
+  probe_kernel("moe_direct_res0_q1_norm1", k_ar_conv_mix<false, true, false, false, true, 1>);
+  probe_kernel("moe_direct_res1_q1_norm1", k_ar_conv_mix<false, true, true, false, true, 1>);
+  probe_kernel("moe_direct_res0_q3_norm1", k_ar_conv_mix<false, true, false, false, true, 3>);
+  probe_kernel("moe_direct_res1_q3_norm1", k_ar_conv_mix<false, true, true, false, true, 3>);
+  probe_kernel("moe_direct_res0_q1_norm0", k_ar_conv_mix<false, true, false, false, false, 1>);
+  probe_kernel("moe_direct_res1_q1_norm0", k_ar_conv_mix<false, true, true, false, false, 1>);
+  probe_kernel("moe_direct_res0_q3_norm0", k_ar_conv_mix<false, true, false, false, false, 3>);
+  probe_kernel("moe_direct_res1_q3_norm0", k_ar_conv_mix<false, true, true, false, false, 3>);
 }
 
 inline bool is_aligned16(const void* p) {
@@ -715,7 +772,8 @@ torch::Tensor ar_conv_mix_forward(
     torch::Tensor queries,
     c10::optional<torch::Tensor> norm_w_opt,
     double eps,
-    double norm_eps) {
+    double norm_eps,
+    int64_t rehearse) {
   TORCH_CHECK(g_init, "all_reduce_conv_mix not initialized");
   const int T = (int)conv_out.size(0);
   const int Q = (int)queries.size(0);
@@ -747,6 +805,7 @@ torch::Tensor ar_conv_mix_forward(
   a.dev_state = g_dev_state;
   a.scratch = g_scratch;
   a.T = T;
+  a.rehearse = (rehearse != 0 && T <= 16) ? 1 : 0;
 
   if (has_combine) {
     TORCH_CHECK(src2dst_opt.has_value() && src2dst_opt.value().defined());
@@ -814,8 +873,8 @@ torch::Tensor ar_conv_mix_forward(
 
   const cudaStream_t st = at::cuda::getCurrentCUDAStream();
 
-  if (!has_combine) {
-    TORCH_CHECK(!has_addend && !has_res && Q == 1,
+  if (!has_combine && !has_addend) {
+    TORCH_CHECK(!has_res && Q == 1,
                 "Post-attn path expects has_addend=false, has_res=false, Q=1");
     if (has_last) {
       if (apply_norm) k_ar_conv_mix<false, false, false, true, true, 1><<<T, NV, 0, st>>>(a);
@@ -823,6 +882,25 @@ torch::Tensor ar_conv_mix_forward(
     } else {
       if (apply_norm) k_ar_conv_mix<false, false, false, false, true, 1><<<T, NV, 0, st>>>(a);
       else k_ar_conv_mix<false, false, false, false, false, 1><<<T, NV, 0, st>>>(a);
+    }
+  } else if (!has_combine) {
+    TORCH_CHECK(has_addend && !has_last, "Direct post-MoE path expects has_addend=true, has_last=false");
+    if (Q == 1) {
+      if (has_res) {
+        if (apply_norm) k_ar_conv_mix<false, true, true, false, true, 1><<<T, NV, 0, st>>>(a);
+        else k_ar_conv_mix<false, true, true, false, false, 1><<<T, NV, 0, st>>>(a);
+      } else {
+        if (apply_norm) k_ar_conv_mix<false, true, false, false, true, 1><<<T, NV, 0, st>>>(a);
+        else k_ar_conv_mix<false, true, false, false, false, 1><<<T, NV, 0, st>>>(a);
+      }
+    } else {
+      if (has_res) {
+        if (apply_norm) k_ar_conv_mix<false, true, true, false, true, 3><<<T, NV, 0, st>>>(a);
+        else k_ar_conv_mix<false, true, true, false, false, 3><<<T, NV, 0, st>>>(a);
+      } else {
+        if (apply_norm) k_ar_conv_mix<false, true, false, false, true, 3><<<T, NV, 0, st>>>(a);
+        else k_ar_conv_mix<false, true, false, false, false, 3><<<T, NV, 0, st>>>(a);
+      }
     }
   } else {
     TORCH_CHECK(has_addend && !has_last, "Post-MoE path expects has_addend=true, has_last=false");

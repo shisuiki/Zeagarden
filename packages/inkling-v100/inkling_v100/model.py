@@ -528,6 +528,7 @@ class Inkling2LoopModel(Inkling2Model):
         use_ar_mix = (
             cm is not None
             and cm.num_tail_writes == 0
+            and cm.num_ckpt_writes == 0
             and is_ar_conv_mix_ready(partial.shape[0])
         )
 
@@ -580,30 +581,53 @@ class Inkling2LoopModel(Inkling2Model):
 
         if use_ar_mix:
             assert cm is not None
-            down, src2dst = layer.mlp(
-                mlp_in[0], pass_idx=pass_idx, return_unreduced_pair=True
-            )
             off_m, w_m = owner.stream_ranges[MLP_STREAM]
-            outputs = all_reduce_conv_mix_cuda(
-                combine=(down, src2dst),
-                conv_weight=layer.mlp_sconv.conv_weight,
-                cache=owner.kv_cache,
-                positions=positions,
-                block_table=cm.block_table,
-                seq_idx=cm.seq_idx,
-                slot_mapping=cm.slot_mapping,
-                query_start=cm.query_start,
-                stream_offset=off_m,
-                stream_width=w_m,
-                addend=attn_out,
-                residual=residual,
-                conv_out=stack[num_blocks],
-                stack=stack[:num_blocks],
-                last=None,
-                queries=next_query,
-                norm_weight=None if next_norm is None else next_norm.weight,
-                norm_eps=0.0 if next_norm is None else next_norm.eps,
-            )
+            if layer.mlp.can_use_fused_m8(mlp_in[0]):
+                moe_partial = layer.mlp(mlp_in[0], reduce=False, pass_idx=pass_idx)
+                outputs = all_reduce_conv_mix_cuda(
+                    x=moe_partial,
+                    conv_weight=layer.mlp_sconv.conv_weight,
+                    cache=owner.kv_cache,
+                    positions=positions,
+                    block_table=cm.block_table,
+                    seq_idx=cm.seq_idx,
+                    slot_mapping=cm.slot_mapping,
+                    query_start=cm.query_start,
+                    stream_offset=off_m,
+                    stream_width=w_m,
+                    addend=attn_out,
+                    residual=residual,
+                    conv_out=stack[num_blocks],
+                    stack=stack[:num_blocks],
+                    last=None,
+                    queries=next_query,
+                    norm_weight=None if next_norm is None else next_norm.weight,
+                    norm_eps=0.0 if next_norm is None else next_norm.eps,
+                )
+            else:
+                down, src2dst = layer.mlp(
+                    mlp_in[0], pass_idx=pass_idx, return_unreduced_pair=True
+                )
+                outputs = all_reduce_conv_mix_cuda(
+                    combine=(down, src2dst),
+                    conv_weight=layer.mlp_sconv.conv_weight,
+                    cache=owner.kv_cache,
+                    positions=positions,
+                    block_table=cm.block_table,
+                    seq_idx=cm.seq_idx,
+                    slot_mapping=cm.slot_mapping,
+                    query_start=cm.query_start,
+                    stream_offset=off_m,
+                    stream_width=w_m,
+                    addend=attn_out,
+                    residual=residual,
+                    conv_out=stack[num_blocks],
+                    stack=stack[:num_blocks],
+                    last=None,
+                    queries=next_query,
+                    norm_weight=None if next_norm is None else next_norm.weight,
+                    norm_eps=0.0 if next_norm is None else next_norm.eps,
+                )
         else:
             moe_out = layer.mlp(mlp_in[0], pass_idx=pass_idx)
             layer.mlp_sconv(

@@ -4,23 +4,35 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.utils import AttentionGroup
 
+from .ops.dspark_markov import shard_argmax
+from .ops.dspark_verify import greedy_verify_tokens, shard_rejection_sample
+from .ops.fp8_dense_cuda import fp8_qpn8_linear
 from .spec_k import capture_counts, k_for, k_ranges, spec_k_config
 
 log = init_logger("vllm.inkling_v100.speculator")
@@ -77,9 +89,19 @@ class Inkling2DSparkSpeculator(DFlashSpeculator):
         self._spec_k_cfg = spec_k_config()
         self._active_k: int = self.draft_block
         self._draft_graph_req_sizes: list[int] = []
+        # Shard-local Markov sampling + shard-local rejection verification (zero vocab all-gather!).
+        self._shard_markov = os.environ.get("INKLING_DSPARK_SHARD_MARKOV", "1") != "0"
+        self._shard_verify = os.environ.get("INKLING_DSPARK_SHARD_VERIFY", "1") != "0"
+        self._zero_temperature = torch.zeros_like(self.temperature)
+        self._dense_local: torch.Tensor | None = None
+        self._row_gathered = np.ones(self.max_num_reqs, dtype=np.bool_)
+        self._sampler: Any = None
+        self._shard_verify_logged: bool = False
+        self._shard_greedy_logged: bool = False
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
-        return self.dtype, 0.0
+        # Match target LM head FP32 precision so probabilistic rejection compares on equal footing.
+        return torch.float32, 0.0
 
     def load_draft_model(
         self,
@@ -93,6 +115,19 @@ class Inkling2DSparkSpeculator(DFlashSpeculator):
             else target_model
         )
         model.attach_target(target_lm)
+        if self._shard_markov and self.speculative_config.draft_sample_method == "probabilistic":
+            shard = int(model.vocab_shard_size)
+            self._dense_local = torch.zeros(
+                (self.max_num_reqs * self.draft_block, shard),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            log.info(
+                "Inkling2 DSpark: shard-local probabilistic Markov + verify enabled "
+                "(local shard=%d, %.1f MiB/GPU).",
+                shard,
+                self._dense_local.numel() * 4 / (1024**2),
+            )
         return model
 
     def set_attn(
@@ -152,7 +187,216 @@ class Inkling2DSparkSpeculator(DFlashSpeculator):
                 return self.draft_tokens[: input_batch.num_reqs]
         else:
             self._active_k = self.draft_block
-        return super().propose(input_batch, *args, **kwargs)
+        out = super().propose(input_batch, *args, **kwargs)
+        if (
+            self._shard_markov
+            and self._dense_local is not None
+            and not kwargs.get("dummy_run")
+            and not kwargs.get("is_profile")
+            and input_batch.num_reqs > 0
+        ):
+            self._row_gathered[input_batch.idx_mapping_np] = False
+        return out
+
+    # ------------------------------------------------- Shard-local target verification
+    def _all_greedy(self, input_batch: InputBatch) -> bool:
+        sampler = self._sampler
+        idx = input_batch.idx_mapping_np
+        if sampler is None or sampler.compute_nans or idx.size == 0:
+            return False
+        states = sampler.sampling_states
+        return bool(
+            np.all(states.temperature.np[idx] == 0.0)
+            and states.max_num_logprobs(idx) == NO_LOGPROBS
+            and sampler.logprob_token_ids_state.max_num_token_ids(idx) == 0
+            and not np.any(sampler.logit_bias_state.use_logit_bias[idx])
+            and not np.any(sampler.penalties_state.use_penalty[idx])
+            and not np.any(sampler.bad_words_state.num_bad_words.np[idx])
+        )
+
+    def _local_verify_ok(self, input_batch: InputBatch) -> bool:
+        sampler = self._sampler
+        idx = input_batch.idx_mapping_np
+        if sampler is None or sampler.compute_nans or idx.size == 0:
+            return False
+        states = sampler.sampling_states
+        return bool(
+            np.all(states.top_k.np[idx] == states.vocab_size)
+            and np.all(states.top_p.np[idx] == 1.0)
+            and np.all(states.min_p.np[idx] == 0.0)
+            and states.max_num_logprobs(idx) == NO_LOGPROBS
+            and sampler.logprob_token_ids_state.max_num_token_ids(idx) == 0
+            and not np.any(sampler.logit_bias_state.use_logit_bias[idx])
+            and not np.any(sampler.penalties_state.use_penalty[idx])
+            and not np.any(sampler.bad_words_state.num_bad_words.np[idx])
+        )
+
+    def _samples(self, input_batch: InputBatch) -> bool:
+        if self._sampler is None:
+            return True
+        temps = self._sampler.sampling_states.temperature.np[input_batch.idx_mapping_np]
+        return bool(np.any(temps != 0.0))
+
+    @staticmethod
+    def _target_head_info(model: nn.Module):
+        lm = model.get_language_model() if hasattr(model, "get_language_model") else model
+        processor = getattr(lm, "logits_processor", None)
+        lm_head = getattr(lm, "lm_head", None)
+        if (
+            processor is None
+            or lm_head is None
+            or processor.scale != 1.0
+            or processor.logits_as_input
+            or getattr(lm_head, "bias", None) is not None
+        ):
+            return None
+        fp8_ready = bool(getattr(lm_head, "_fp8_ready", False))
+        shard = int(lm_head._fp8_n_out) if fp8_ready else int(lm_head.weight.shape[0])
+        rank = get_tensor_model_parallel_rank()
+        world = get_tensor_model_parallel_world_size()
+        id_base = rank * shard
+        num_valid = min(max(int(processor.org_vocab_size) - id_base, 0), shard)
+        return lm_head, processor.soft_cap, num_valid, id_base, rank, world
+
+    @staticmethod
+    def _target_local_logits(lm_head: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        if getattr(lm_head, "_fp8_ready", False):
+            return fp8_qpn8_linear(
+                hidden_states,
+                lm_head._fp8_codes,
+                lm_head._fp8_s16,
+                lm_head._fp8_s32,
+                lm_head._fp8_n_out,
+                out_dtype=torch.float32,
+                is_lm_head=True,
+            )
+        return torch.mm(hidden_states, lm_head.weight.t(), out_dtype=torch.float32)
+
+    def _gather_dense_for(self, input_batch: InputBatch) -> None:
+        assert self._dense_local is not None and self.draft_logits is not None
+        per_req = input_batch.num_draft_tokens_per_req
+        if per_req is None:
+            return
+        n_spec = self.draft_block
+        rows = [
+            int(state) * n_spec + i
+            for state, n in zip(input_batch.idx_mapping_np.tolist(), per_req.tolist())
+            for i in range(n)
+        ]
+        if not rows:
+            return
+        index = torch.tensor(rows, dtype=torch.int64, device=self.device)
+        gathered = self.model.gather_dense_logits(self._dense_local[index])
+        vocab = self.draft_logits.shape[-1]
+        self.draft_logits.view(-1, vocab)[index] = gathered[:, :vocab]
+        self._row_gathered[input_batch.idx_mapping_np] = True
+
+    def try_sample_target(
+        self,
+        model: nn.Module,
+        rejection_sampler: Any,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: Any,
+        *,
+        allow_graph: bool = True,
+    ) -> SamplerOutput | None:
+        del allow_graph
+        if rejection_sampler is not None and self._sampler is None:
+            self._sampler = rejection_sampler.sampler
+
+        output: SamplerOutput | None = None
+        if (
+            self._shard_verify
+            and grammar_output is None
+            and rejection_sampler is not None
+            and getattr(rejection_sampler, "synthetic_conditional_rates", None) is None
+        ):
+            head = self._target_head_info(model)
+            if head is not None:
+                lm_head, softcap, num_valid, id_base, rank, world = head
+                if self._all_greedy(input_batch):
+                    local_logits = self._target_local_logits(lm_head, hidden_states)
+                    target_ids = shard_argmax(
+                        local_logits,
+                        softcap,
+                        num_valid,
+                        id_base,
+                        rank,
+                        world,
+                        tensor_model_parallel_all_reduce,
+                    )
+                    if not self._shard_greedy_logged:
+                        self._shard_greedy_logged = True
+                        log.info(
+                            "Inkling2 DSpark: shard-local greedy target verification active."
+                        )
+                    if input_batch.num_draft_tokens > 0:
+                        sampled, num_sampled = greedy_verify_tokens(
+                            target_ids,
+                            input_batch.input_ids[input_batch.logits_indices],
+                            input_batch.cu_num_logits,
+                            self.draft_block,
+                        )
+                    else:
+                        sampled = target_ids.view(-1, 1)
+                        num_sampled = input_batch.seq_lens.new_ones(input_batch.num_reqs)
+                    output = SamplerOutput(
+                        sampled_token_ids=sampled,
+                        logprobs_tensors=None,
+                        num_nans=None,
+                        num_sampled=num_sampled,
+                    )
+                elif self._local_verify_ok(input_batch) and (
+                    input_batch.num_draft_tokens == 0
+                    or (self._shard_markov and self._dense_local is not None)
+                ):
+                    local_logits = self._target_local_logits(lm_head, hidden_states)
+                    states = self._sampler.sampling_states
+                    sampled, num_sampled = shard_rejection_sample(
+                        local_logits,
+                        self._dense_local if input_batch.num_draft_tokens > 0 else None,
+                        input_batch.input_ids,
+                        input_batch.logits_indices,
+                        input_batch.cu_num_logits,
+                        input_batch.positions[input_batch.logits_indices],
+                        input_batch.idx_mapping,
+                        input_batch.expanded_idx_mapping,
+                        input_batch.expanded_local_pos,
+                        states.temperature.gpu,
+                        states.seeds.gpu,
+                        self.draft_block,
+                        softcap,
+                        num_valid,
+                        id_base,
+                        rank,
+                        world,
+                        self.use_fp64_gumbel,
+                        tensor_model_parallel_all_reduce,
+                    )
+                    if not self._shard_verify_logged:
+                        self._shard_verify_logged = True
+                        log.info(
+                            "Inkling2 DSpark: shard-local probabilistic rejection sampling active."
+                        )
+                    output = SamplerOutput(
+                        sampled_token_ids=sampled,
+                        logprobs_tensors=None,
+                        num_nans=None,
+                        num_sampled=num_sampled,
+                    )
+
+        if (
+            output is None
+            and self._shard_markov
+            and self._dense_local is not None
+            and self.draft_logits is not None
+            and input_batch.num_draft_tokens > 0
+            and not self._row_gathered[input_batch.idx_mapping_np].all()
+            and self._samples(input_batch)
+        ):
+            self._gather_dense_for(input_batch)
+        return output
 
     def _strip_draft_groups_from_target(self) -> None:
         """Remove draft-only AttentionGroups from target `model_runner.attn_groups`.
@@ -351,6 +595,34 @@ class Inkling2DSparkSpeculator(DFlashSpeculator):
             if self._spec_k_cfg is not None
             else n_full
         )
+        if self._shard_markov:
+            probabilistic = self.draft_logits is not None and self._dense_local is not None
+            if n_spec == n_full:
+                hidden = last_hidden_states[self.sample_indices[: num_reqs * n_full]]
+            else:
+                sidx = (
+                    self.sample_indices[: num_reqs * n_full]
+                    .view(num_reqs, n_full)[:, :n_spec]
+                    .reshape(-1)
+                )
+                hidden = last_hidden_states[sidx]
+            self.model.markov_sample(
+                hidden,
+                self.f_rnn[:num_reqs],
+                self.draft_tokens,
+                self.input_buffers.input_ids,
+                self.num_query_per_req,
+                self.sample_idx_mapping,
+                self.sample_pos,
+                self.temperature if probabilistic else self._zero_temperature,
+                self.seeds,
+                self._dense_local if probabilistic else None,
+                n_full,
+                self.use_fp64_gumbel,
+            )
+            self._debug_proposal_stage("dspark markov head end")
+            return
+
         if n_spec == n_full:
             num_sample = num_reqs * n_full
             hidden = last_hidden_states[self.sample_indices[:num_sample]]

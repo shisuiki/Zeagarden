@@ -1283,3 +1283,198 @@ def attention_prologue(
         ring_commit_tail(
             v, cache, positions, tail_src_toks, tail_req_slots, num_tail_writes, head_dim, head_dim
         )
+
+
+def kv_conv_prologue(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    k_dynamic: torch.Tensor | None,
+    v_dynamic: torch.Tensor | None,
+    cache: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_idx: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    query_start: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    *,
+    clip_threshold: float,
+    norm_eps: float,
+    clip_eps: float = 1e-6,
+    tail_src_toks: torch.Tensor | None = None,
+    tail_req_slots: torch.Tensor | None = None,
+    num_tail_writes: int = 0,
+    ckpt_dst: torch.Tensor | None = None,
+    ckpt_b_pos: torch.Tensor | None = None,
+    ckpt_qstart: torch.Tensor | None = None,
+    ckpt_start_pos: torch.Tensor | None = None,
+    ckpt_req_slots: torch.Tensor | None = None,
+    num_ckpt_writes: int = 0,
+) -> None:
+    """K/V short conv + K L2-clip + V RMSNorm + paged KV/conv-cache writes ONLY (no rel_logits)."""
+    num_tokens = kv_slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+    num_heads, head_dim = key_cache.shape[2:]
+    assert k.stride(1) == v.stride(1) == 1 and cache.stride(3) == 1
+    assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
+    is_fp8_kv = key_cache.element_size() == 1
+    kc_arg = key_cache.view(torch.uint8) if is_fp8_kv else key_cache
+    vc_arg = value_cache.view(torch.uint8) if is_fp8_kv else value_cache
+    dynamic = k_dynamic is not None
+    if dynamic:
+        assert k_dynamic is not None and v_dynamic is not None
+        width = k_weight.shape[0]
+        dyn_strides = (k_dynamic.stride(0), v_dynamic.stride(0))
+    else:
+        width = k_weight.shape[1]
+        dyn_strides = (0, 0)
+    block_t = 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 4
+    grid = (triton.cdiv(num_tokens, block_t), num_heads, 2)
+    _kv_conv_tile[grid](
+        k,
+        v,
+        k_weight,
+        v_weight,
+        k_dynamic if dynamic else k_weight,
+        v_dynamic if dynamic else v_weight,
+        cache,
+        kc_arg,
+        vc_arg,
+        kv_slot_mapping,
+        positions,
+        seq_idx,
+        slot_mapping,
+        block_table,
+        query_start,
+        num_tokens,
+        k.stride(0),
+        v.stride(0),
+        k_weight.stride(0),
+        k_weight.stride(1),
+        *dyn_strides,
+        cache.stride(0),
+        cache.stride(1),
+        cache.stride(2),
+        kc_arg.stride(0),
+        kc_arg.stride(1),
+        kc_arg.stride(2),
+        kc_arg.shape[1],
+        block_table.stride(0),
+        block_table.shape[1],
+        cache.shape[2],
+        (width * (2 if dynamic else 1) + 1) ** -0.5,
+        clip_threshold,
+        clip_eps,
+        norm_eps,
+        W=width,
+        D=head_dim,
+        DYNAMIC=dynamic,
+        IS_FP8_KV=is_fp8_kv,
+        BT=block_t,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    if (
+        num_ckpt_writes > 0
+        and ckpt_dst is not None
+        and ckpt_b_pos is not None
+        and ckpt_qstart is not None
+        and ckpt_start_pos is not None
+        and ckpt_req_slots is not None
+    ):
+        ring_capture_ckpt(
+            k,
+            cache,
+            ckpt_dst,
+            ckpt_b_pos,
+            ckpt_qstart,
+            ckpt_start_pos,
+            ckpt_req_slots,
+            num_ckpt_writes,
+            0,
+            head_dim,
+        )
+        ring_capture_ckpt(
+            v,
+            cache,
+            ckpt_dst,
+            ckpt_b_pos,
+            ckpt_qstart,
+            ckpt_start_pos,
+            ckpt_req_slots,
+            num_ckpt_writes,
+            head_dim,
+            head_dim,
+        )
+    if num_tail_writes > 0 and tail_src_toks is not None and tail_req_slots is not None:
+        ring_commit_tail(
+            k, cache, positions, tail_src_toks, tail_req_slots, num_tail_writes, 0, head_dim
+        )
+        ring_commit_tail(
+            v, cache, positions, tail_src_toks, tail_req_slots, num_tail_writes, head_dim, head_dim
+        )
+
+
+def qr_clip_rel_only(
+    q: torch.Tensor,
+    r: torch.Tensor,
+    q_scale: torch.Tensor,
+    r_scale: torch.Tensor,
+    tau: torch.Tensor | None,
+    rel_proj: torch.Tensor,
+    q_out: torch.Tensor,
+    rel_out: torch.Tensor,
+    seq_idx: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    clip_threshold: float,
+    rel_threshold: float,
+    clip_eps: float = 1e-6,
+) -> None:
+    """Compute clipped Q and sheared `rel_logits` ONLY (when K/V conv already ran)."""
+    num_tokens = q.shape[0]
+    if num_tokens == 0:
+        return
+    num_q_heads, head_dim = q.shape[1:]
+    d_rel = r.shape[2]
+    extent = rel_proj.shape[2] - _SHIFT_PAD
+    block_e = min(extent, 256)
+    qr_tokens = 8 if num_tokens >= 64 else 4
+    qr_blocks = 1 + (extent + 256) // block_e
+    tau_arg = tau if tau is not None else q_scale
+    _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
+        q,
+        r,
+        q_scale,
+        r_scale,
+        tau_arg,
+        rel_proj,
+        q_out,
+        rel_out,
+        seq_idx,
+        cu_seqlens_q,
+        seq_lens,
+        num_tokens,
+        q.stride(0),
+        r.stride(0),
+        clip_threshold,
+        rel_threshold,
+        clip_eps,
+        HQ=num_q_heads,
+        D=head_dim,
+        D_REL=d_rel,
+        E=extent,
+        SHIFT_W=rel_proj.shape[2],
+        HAS_TAU=tau is not None,
+        BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+        BLOCK_E=block_e,
+        QR_TOKENS=qr_tokens,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )

@@ -163,6 +163,12 @@ def all_reduce_conv_mix_cuda(
     ext = load_ar_conv_mix_ext()
     down = None if combine is None else combine[0]
     src2dst = None if combine is None else combine[1]
+    env_reh = os.environ.get("INKLING_AR_REHEARSE")
+    if env_reh is not None:
+        rehearse = 0 if env_reh == "0" else 1
+    else:
+        n_tok = int(x.shape[0]) if x is not None else int(src2dst.numel() // 8)
+        rehearse = 1 if n_tok >= 4 else 0
     return ext.ar_conv_mix_forward(
         x,
         down,
@@ -185,4 +191,5 @@ def all_reduce_conv_mix_cuda(
         norm_weight,
         float(eps),
         float(norm_eps),
+        int(rehearse),
     )

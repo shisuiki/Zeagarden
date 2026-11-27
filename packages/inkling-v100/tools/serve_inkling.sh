@@ -23,6 +23,7 @@ fi
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
+export VLLM_USE_SPINLOOP_EXT="${VLLM_USE_SPINLOOP_EXT:-1}"
 export VLLM_V41_PIN_CORES="${VLLM_V41_PIN_CORES:-0,1,2,3}"
 export VLLM_V41_PIN_ENGINE="${VLLM_V41_PIN_ENGINE:-4}"
 export INKLING_FP8_TIERS="${INKLING_FP8_TIERS:-attn,lm_head}"
@@ -50,10 +51,16 @@ else
   ARGS+=(--enable-prefix-caching)
 fi
 
+VLLM_VER="$(python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || true)"
+if [[ "$VLLM_VER" == 1.5.4* ]]; then
+  ARGS+=(--no-split-mtp-phase-pure)
+fi
+
 if [ -n "${DSPARK_DIR:-}" ]; then
+  DRAFT_SAMPLE="${DRAFT_SAMPLE_METHOD:-probabilistic}"
   ARGS+=(
     --speculative-config
-    "{\"method\":\"dflash\",\"model\":\"${DSPARK_DIR}\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"greedy\"}"
+    "{\"method\":\"dflash\",\"model\":\"${DSPARK_DIR}\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"${DRAFT_SAMPLE}\"}"
   )
 fi
 

@@ -22,6 +22,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -35,6 +36,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .configs import Inkling2DSparkConfig
+from .ops.dspark_markov import markov_sample as _shard_markov_sample
 from .ops.dspark_sm70 import (
     add_softcap,
     markov_gate,
@@ -274,6 +276,7 @@ class Inkling2MarkovHead(nn.Module):
         self.rnn_bias: torch.Tensor | None = None
         self.rnn_w_step_t: torch.Tensor | None = None
         self.rnn_w_ctx_t: torch.Tensor | None = None
+        self.w_state: torch.Tensor | None = None
 
     @torch.no_grad()
     def fold(
@@ -303,14 +306,18 @@ class Inkling2MarkovHead(nn.Module):
                 head = lm_head_weight[rows].double()
             self.fold_weight[rows].copy_((head @ projection).to(torch.float16))
             self.fold_bias[rows].copy_((head @ bias).to(torch.float16))
-        # Cache contiguous transposed slices of rnn_proj.weight for fast cuBLAS addmm.
+        # Cache contiguous slices of rnn_proj.weight for cuBLAS addmm & shard-local Markov kernel.
         w = self.rnn_proj.weight
-        w_step_t = w[:, : 2 * self.markov_rank].t().contiguous()
+        w_state = w[:, : 2 * self.markov_rank].contiguous()
+        w_step_t = w_state.t().contiguous()
         w_ctx_t = w[:, 2 * self.markov_rank :].t().contiguous()
         if self.rnn_w_step_t is None:
+            self.w_state = w_state
             self.rnn_w_step_t = w_step_t
             self.rnn_w_ctx_t = w_ctx_t
         else:
+            assert self.w_state is not None
+            self.w_state.copy_(w_state)
             self.rnn_w_step_t.copy_(w_step_t)
             assert self.rnn_w_ctx_t is not None
             self.rnn_w_ctx_t.copy_(w_ctx_t)
@@ -540,7 +547,9 @@ class Inkling2DSparkModel(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
-    def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_base_logits(
+        self, hidden_states: torch.Tensor, *, out_dtype: torch.dtype = torch.float16
+    ) -> torch.Tensor:
         assert self.lm_head is not None
         if getattr(self.lm_head, "_fp8_ready", False):
             return fp8_qpn8_linear(
@@ -549,10 +558,63 @@ class Inkling2DSparkModel(nn.Module):
                 self.lm_head._fp8_s16,
                 self.lm_head._fp8_s32,
                 self.lm_head._fp8_n_out,
-                out_dtype=torch.float16,
+                out_dtype=out_dtype,
                 is_lm_head=True,
             )
+        if out_dtype == torch.float32 and hidden_states.dtype == torch.float16:
+            return torch.mm(hidden_states, self.lm_head.weight.t(), out_dtype=torch.float32)
         return F.linear(hidden_states, self.lm_head.weight)
+
+    def markov_sample(
+        self,
+        hidden_states: torch.Tensor,
+        f_rnn: torch.Tensor,
+        tokens: torch.Tensor,
+        anchors: torch.Tensor,
+        anchor_stride: int,
+        idx_map: torch.Tensor,
+        sample_pos: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dense: torch.Tensor | None,
+        num_spec: int,
+        use_fp64: bool,
+    ) -> None:
+        """Shard-local recurrent Markov head sampling (both greedy and probabilistic)."""
+        head = self.model.markov_head
+        assert head.fold_weight is not None and head.fold_bias is not None and head.w_state is not None
+        shard = head.fold_weight.shape[0]
+        id_base = self.tp_rank * shard
+        num_valid = min(max(self.config.vocab_size - id_base, 0), shard)
+        _shard_markov_sample(
+            self.compute_base_logits(hidden_states, out_dtype=torch.float32),
+            head.context(hidden_states, f_rnn),
+            head.w_state,
+            head.markov_w1.weight,
+            head.fold_weight,
+            head.fold_bias,
+            tokens,
+            anchors,
+            anchor_stride,
+            idx_map,
+            sample_pos,
+            temperature,
+            seeds,
+            dense,
+            num_spec,
+            num_valid,
+            id_base,
+            self.tp_rank,
+            self.tp_size,
+            float(self.config.final_logit_softcapping),
+            use_fp64,
+            tensor_model_parallel_all_reduce,
+        )
+
+    def gather_dense_logits(self, dense: torch.Tensor) -> torch.Tensor:
+        if self.tp_size == 1:
+            return dense
+        return tensor_model_parallel_all_gather(dense)
 
     def markov_step(
         self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor

@@ -54,6 +54,14 @@ from .ops.attn_rel_dec_cuda import (
     preallocate_workspace as preallocate_attn_workspace,
     rel_decode_attention_cuda,
 )
+from .ops.attn_rel_dec2_cuda import (
+    load_attn_rel_dec2_ext,
+    plan_dec2_splits,
+    preallocate_dec2_workspace,
+    rel_decode_attention2_cuda,
+    supports_dec2,
+    usable_dec2,
+)
 from .ops.attn_rel_gla_cuda import (
     elr_global_kv_enabled,
     get_gla_linear_slots,
@@ -73,6 +81,12 @@ from .ops.attn_rel_pf_cuda import (
     load_attn_rel_pf_ext,
     rel_prefill_attention_cuda,
 )
+from .ops.attn_rel_pf_wmma_cuda import (
+    clip_qr,
+    load_attn_rel_pf_wmma_ext,
+    rel_prefill_attention_wmma_cuda,
+    supports_prefill_wmma,
+)
 from .ops.fp8_dense_cuda import (
     fp8_enabled_tiers,
     fp8_qpn8_linear,
@@ -81,7 +95,12 @@ from .ops.fp8_dense_cuda import (
     preallocate_fp8_dequant_ws,
     prepare_qpn8_weight,
 )
-from .ops.sconv import attention_prologue, shift_rel_proj
+from .ops.sconv import (
+    attention_prologue,
+    kv_conv_prologue,
+    qr_clip_rel_only,
+    shift_rel_proj,
+)
 
 log = init_logger("vllm.inkling_v100.attention")
 _GLOBAL_OPT_LOGGED = False
@@ -416,9 +435,34 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self._use_cuda_attn = (
             self.head_dim == 128 and os.environ.get("INKLING_USE_CUDA_ATTN", "1") != "0"
         )
+        self._use_cuda_attn_dec2 = (
+            self._use_cuda_attn
+            and not self.use_gla
+            and supports_dec2(
+                self.num_heads, self.num_kv_heads, self.head_dim, self.d_rel, torch.float16
+            )
+        )
+        self._dec2_max_reqs = int(
+            os.environ.get(
+                "INKLING_DEC2_MAX_REQS",
+                os.environ.get(
+                    "INKLING_DEC2_MAX_REQS_LOCAL" if is_local else "INKLING_DEC2_MAX_REQS_GLOBAL",
+                    "8" if is_local else "1",
+                ),
+            )
+        )
         self._use_cuda_attn_pf = (
             self.head_dim == 128 and os.environ.get("INKLING_USE_CUDA_ATTN_PF", "1") != "0"
         )
+        self._use_cuda_attn_pf_wmma = (
+            self._use_cuda_attn_pf
+            and not self.use_gla
+            and os.environ.get("INKLING_USE_CUDA_ATTN_PF_WMMA", "1") != "0"
+            and supports_prefill_wmma(
+                self.num_heads, self.num_kv_heads, self.head_dim, self.d_rel, torch.float16
+            )
+        )
+        self.rel_proj_t: torch.Tensor | None = None
         self.kv_cache = torch.tensor([])
         forward_context = vllm_config.compilation_config.static_forward_context
         if prefix in forward_context:
@@ -430,11 +474,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if len(self.split_sizes) > 6 and self.split_sizes[6] > 0 and self.qkvr.weight.numel() > 0:
             self.qkvr.weight.data[-self.split_sizes[6] :].zero_()
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
+        self.rel_proj_t = self.rel_logits_proj.t().contiguous()
         if self._use_cuda_attn:
             load_attn_rel_dec_ext()
             preallocate_attn_workspace(slots=65536, device=dev)
+        if self._use_cuda_attn_dec2:
+            load_attn_rel_dec2_ext()
+            preallocate_dec2_workspace(device=dev, max_slots=8192)
         if self._use_cuda_attn_pf:
             load_attn_rel_pf_ext()
+        if self._use_cuda_attn_pf_wmma:
+            load_attn_rel_pf_wmma_ext()
         if "attn" in fp8_enabled_tiers() and not self._fp8_attn:
             self._load_offline_fp8_weights(dev)
         if self.use_gla and not self._gla_projs:
@@ -706,23 +756,213 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if isinstance(attn_metadata, dict) and kv_cache.numel() > 0:
             md = cast(Inkling2AttentionMetadata | None, attn_metadata.get(layer_name))
         if md is None:
-            # Profile run before KV allocation: reserve transient attention workspace
-            # peak (`rel_logits` + `pf_out`) so `determine_available_memory` accounts
-            # for 4K prefill activations accurately, then zero output cleanly.
-            _rel_tmp = q.new_empty((num_tokens + 128, self.num_heads, self.rel_extent + 256))
-            _pf_tmp = q.new_empty(
-                (num_tokens, self.num_heads, self.head_dim), dtype=torch.float32
-            )
-            del _rel_tmp, _pf_tmp
+            # Profile run before KV allocation: reserve transient attention workspace peak.
+            if self._use_cuda_attn_pf_wmma:
+                _q_tmp = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+                _r_tmp = torch.empty(r.shape, dtype=r.dtype, device=r.device)
+                del _q_tmp, _r_tmp
+            else:
+                _rel_tmp = q.new_empty((num_tokens + 128, self.num_heads, self.rel_extent + 256))
+                _pf_tmp = q.new_empty(
+                    (num_tokens, self.num_heads, self.head_dim), dtype=torch.float32
+                )
+                del _rel_tmp, _pf_tmp
             output.zero_()
             return
 
-        num_decodes, num_decode_tokens, decode_splits = self._plan_decode(md, num_tokens)
-        clipped_q = q.new_empty(q.shape)
-        rel_logits = q.new_empty((num_tokens + 128, self.num_heads, self.rel_extent + 256))
         conv_md = conv_metadata(conv_state)
         assert conv_md is not None
         key_cache, value_cache = self._split_kv_cache(kv_cache)
+
+        # Fast path 1: 1-launch short-SASS fused kv_conv_prologue + decode_attention2 (C<=max_reqs, Q<=8).
+        if (
+            self._use_cuda_attn_dec2
+            and self.rel_proj_t is not None
+            and conv_md.num_tail_writes == 0
+            and conv_md.num_ckpt_writes == 0
+            and md.max_query_len <= 8
+            and int(md.seq_lens.shape[0]) <= self._dec2_max_reqs
+        ):
+            dec2_splits = plan_dec2_splits(
+                num_reqs=int(md.seq_lens.shape[0]),
+                num_kv_heads=self.num_kv_heads,
+                max_query_len=md.max_query_len,
+                is_local=self.is_local,
+            )
+            if dec2_splits > 0 and usable_dec2(
+                q,
+                k,
+                v,
+                self.k_sconv.conv_weight,
+                self.v_sconv.conv_weight,
+                k_dynamic,
+                v_dynamic,
+                key_cache,
+                value_cache,
+                conv_state.kv_cache,
+                positions,
+                conv_md.slot_mapping,
+                md.slot_mapping,
+                r=r,
+                gate=gate,
+                sinks=sinks,
+                rel_t=self.rel_proj_t,
+                out=output,
+            ):
+                rel_decode_attention2_cuda(
+                    q,
+                    r,
+                    self.q_scale,
+                    self.r_scale,
+                    tau,
+                    self.rel_proj_t,
+                    key_cache,
+                    value_cache,
+                    gate,
+                    sinks,
+                    output,
+                    k=k,
+                    v=v,
+                    k_weight=self.k_sconv.conv_weight,
+                    v_weight=self.v_sconv.conv_weight,
+                    k_dynamic=k_dynamic,
+                    v_dynamic=v_dynamic,
+                    conv_cache=conv_state.kv_cache,
+                    positions=positions,
+                    conv_block_table=conv_md.block_table,
+                    seq_idx=conv_md.seq_idx,
+                    conv_slot_mapping=conv_md.slot_mapping,
+                    query_start=conv_md.query_start,
+                    kv_slot_mapping=md.slot_mapping,
+                    block_table=md.block_table,
+                    seq_lens=md.seq_lens,
+                    cu_seqlens_q=md.query_start_loc,
+                    max_query_len=md.max_query_len,
+                    num_actual_tokens=md.num_actual_tokens,
+                    softmax_scale=self.scaling,
+                    window=self.sliding_window if self.is_local else 0,
+                    num_splits=dec2_splits,
+                    qk_clip=self.qk_clip,
+                    rel_clip=self.rel_clip,
+                    norm_eps=self.eps,
+                )
+                return
+
+        num_decodes, num_decode_tokens, decode_splits = self._plan_decode(md, num_tokens)
+
+        # Fast path 2: On-the-fly Tensor-Core R @ rel_proj WMMA prefill (eliminates global rel_logits!).
+        if (
+            self._use_cuda_attn_pf_wmma
+            and not self.use_gla
+            and num_decode_tokens < num_tokens
+        ):
+            kv_conv_prologue(
+                k,
+                v,
+                self.k_sconv.conv_weight,
+                self.v_sconv.conv_weight,
+                k_dynamic,
+                v_dynamic,
+                conv_state.kv_cache,
+                positions,
+                conv_md.block_table,
+                conv_md.seq_idx,
+                conv_md.slot_mapping,
+                conv_md.query_start,
+                key_cache,
+                value_cache,
+                md.slot_mapping,
+                clip_threshold=self.qk_clip,
+                norm_eps=self.eps,
+                tail_src_toks=conv_md.tail_src_toks,
+                tail_req_slots=conv_md.tail_req_slots,
+                num_tail_writes=conv_md.num_tail_writes,
+                ckpt_dst=conv_md.layer_ckpt_dst(conv_state.ring_layer_idx),
+                ckpt_b_pos=conv_md.ckpt_b_pos,
+                ckpt_qstart=conv_md.ckpt_qstart,
+                ckpt_start_pos=conv_md.ckpt_start_pos,
+                ckpt_req_slots=conv_md.ckpt_req_slots,
+                num_ckpt_writes=conv_md.num_ckpt_writes,
+            )
+            if decode_splits:
+                # Mixed batch: materialize tiny sheared rel_logits ONLY for the decode prefix.
+                dec_q = torch.empty(
+                    (num_decode_tokens, self.num_heads, self.head_dim),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                dec_rel = q.new_empty(
+                    (num_decode_tokens + 128, self.num_heads, self.rel_extent + 256)
+                )
+                qr_clip_rel_only(
+                    q[:num_decode_tokens],
+                    r[:num_decode_tokens],
+                    self.q_scale,
+                    self.r_scale,
+                    None if tau is None else tau[:num_decode_tokens],
+                    self.rel_proj_shifted,
+                    dec_q,
+                    dec_rel,
+                    conv_md.seq_idx[:num_decode_tokens],
+                    md.query_start_loc[: num_decodes + 1],
+                    md.seq_lens[:num_decodes],
+                    clip_threshold=self.qk_clip,
+                    rel_threshold=self.rel_clip,
+                )
+                dec_actual = md.num_decode_tokens
+                max_q = min(self.max_decode_query_len, dec_actual - num_decodes + 1)
+                dec_fn = rel_decode_attention_cuda if self._use_cuda_attn else rel_decode_attention
+                dec_fn(
+                    dec_q,
+                    key_cache,
+                    value_cache,
+                    dec_rel,
+                    gate[:num_decode_tokens],
+                    sinks[:num_decode_tokens],
+                    output[:num_decode_tokens],
+                    block_table=md.block_table[:num_decodes],
+                    cache_seqlens=md.seq_lens[:num_decodes],
+                    cu_seqlens_q=md.query_start_loc[: num_decodes + 1],
+                    max_query_len=max_q,
+                    num_actual_tokens=dec_actual,
+                    softmax_scale=self.scaling,
+                    is_local=self.is_local,
+                    num_splits=decode_splits,
+                )
+            pf_q, pf_r = clip_qr(
+                q[num_decode_tokens:],
+                r[num_decode_tokens:],
+                self.q_scale,
+                self.r_scale,
+                None if tau is None else tau[num_decode_tokens:],
+                clip_threshold=self.qk_clip,
+                rel_threshold=self.rel_clip,
+            )
+            nt = md.num_actual_tokens - (md.num_decode_tokens if num_decodes else 0)
+            cu_q = md.query_start_loc[num_decodes:]
+            if num_decodes:
+                cu_q = cu_q - md.num_decode_tokens
+            rel_prefill_attention_wmma_cuda(
+                pf_q,
+                pf_r,
+                self.rel_logits_proj,
+                key_cache,
+                value_cache,
+                gate[num_decode_tokens:],
+                sinks[num_decode_tokens:],
+                output[num_decode_tokens:],
+                block_table=md.block_table[num_decodes:],
+                cache_seqlens=md.seq_lens[num_decodes:],
+                cu_seqlens_q=cu_q,
+                max_query_len=md.max_query_len,
+                softmax_scale=self.scaling,
+                window=self.sliding_window if self.is_local else 0,
+                num_actual_tokens=max(nt, 0),
+            )
+            return
+
+        clipped_q = q.new_empty(q.shape)
+        rel_logits = q.new_empty((num_tokens + 128, self.num_heads, self.rel_extent + 256))
 
         if self.use_gla:
             w_down, u_k_t, u_v = self._gla_projs[pass_idx]

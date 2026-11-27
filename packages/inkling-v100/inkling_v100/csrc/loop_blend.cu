@@ -28,6 +28,247 @@ namespace {
 
 constexpr int BLEND_MAX_T = 32;
 constexpr int BLEND_MAX_S = 4;
+constexpr int BLEND_ONE_NT = 128;
+constexpr int BLEND_ONE_R = 64;
+constexpr int BLEND_ONE_D = 2304;
+constexpr int BLEND_ONE_K8 = (2 * BLEND_ONE_D) / 8;  // 576
+constexpr int BLEND_ONE_MAX_CTAS = 560;              // 80 SMs x 7 co-resident CTAs
+
+__device__ __forceinline__ float rsqrt_approx_f32(float x) {
+  float y;
+  asm("rsqrt.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float shfl_bfly_blend(float v, int o) {
+  float r;
+  asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(r) : "f"(v), "r"(o));
+  return r;
+}
+
+__device__ __forceinline__ float warp_sum_blend(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += shfl_bfly_blend(v, o);
+  return v;
+}
+
+__device__ __forceinline__ void prefetch_l2_blend(const void* p) {
+  asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+
+__device__ __forceinline__ float2 h2f2_blend(unsigned u) {
+  return __half22float2(*reinterpret_cast<__half2*>(&u));
+}
+
+// Self-resetting row-scoped grid barrier over CB co-resident CTAs (0..2*CB-1 cycle).
+__device__ __forceinline__ void row_barrier_blend(unsigned* ctr, int CB) {
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned old = atomicInc(ctr, 2u * CB - 1u);
+    const bool ph1 = old >= (unsigned)CB;
+    volatile unsigned* c = ctr;
+    while (true) {
+      const unsigned v = *c;
+      if (ph1 ? (v < (unsigned)CB) : (v >= (unsigned)CB)) break;
+    }
+    __threadfence();
+  }
+  __syncthreads();
+}
+
+// ---- One-Launch Cooperative Token-Parallel Blend (D=2304, R=64, S*T*18 <= 560) ----
+// Grid: (D / 128 = 18, S * T), Block: 128 (4 warps). Eliminates 1 launch & global `x` write/read!
+__global__ void __launch_bounds__(BLEND_ONE_NT, 7)
+k_blend_fused_one(
+    const float* __restrict__ dest,
+    int64_t dest_stride_s,
+    const float* __restrict__ msg,
+    const __half* __restrict__ wd,
+    int64_t wd_stride_s,
+    const __half* __restrict__ wgf,
+    int64_t wgf_stride_s,
+    const __half* __restrict__ nw,
+    int64_t nw_stride_s,
+    __half* hidden,
+    float* partial,
+    unsigned* counters,
+    __half* __restrict__ out,
+    int T,
+    float pair_eps,
+    float eps) {
+  __shared__ __align__(16) __half pair[2 * BLEND_ONE_D];
+  __shared__ __align__(16) float hs[BLEND_ONE_R];
+  __shared__ float red[2][BLEND_ONE_NT / 32];
+  __shared__ float red2[BLEND_ONE_NT / 32];
+  __shared__ float rs1;
+
+  const int y = blockIdx.y;
+  const int s = y / T;
+  const int t = y - s * T;
+  const int cb = blockIdx.x;
+  const int CB = gridDim.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const float* drow = dest + s * dest_stride_s + (int64_t)t * BLEND_ONE_D;
+  const float* mrow = msg + (int64_t)y * BLEND_ONE_D;
+
+  // Prefetch weights of both phases toward L2 immediately.
+  {
+    const __half* gwp = wgf + s * wgf_stride_s + (int64_t)(cb * BLEND_ONE_NT + tid) * BLEND_ONE_R;
+    prefetch_l2_blend(gwp);
+    prefetch_l2_blend(gwp + (int64_t)BLEND_ONE_D * BLEND_ONE_R);
+    if (cb * 4 < BLEND_ONE_R) {
+      const char* wp = reinterpret_cast<const char*>(
+          wd + s * wd_stride_s + (int64_t)(cb * 4 + warp) * 2 * BLEND_ONE_D);
+      prefetch_l2_blend(wp + lane * 128);
+      prefetch_l2_blend(wp + (lane + 32) * 128);
+      if (lane < 8) prefetch_l2_blend(wp + (lane + 64) * 128);
+    }
+  }
+
+  // Phase A: pair RMSNorm + rank-64 down projection (rows 4*cb .. 4*cb+3)
+  if (cb * 4 < BLEND_ONE_R) {
+    const int r = cb * 4 + warp;
+    const uint4* w8 = reinterpret_cast<const uint4*>(
+        wd + s * wd_stride_s + (int64_t)r * 2 * BLEND_ONE_D);
+    const float4* d4 = reinterpret_cast<const float4*>(drow);
+    const float4* m4 = reinterpret_cast<const float4*>(mrow);
+    constexpr int n4 = BLEND_ONE_D >> 2;  // 576
+    float4 da[5], ma[5];
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+      const int q = tid + 128 * i;
+      if (q < n4) {
+        da[i] = d4[q];
+        ma[i] = m4[q];
+      } else {
+        da[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        ma[i] = da[i];
+      }
+    }
+    float sd = 0.f, sm = 0.f;
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+      const float4 a = da[i], b = ma[i];
+      sd = __fmaf_rn(a.x, a.x, sd); sd = __fmaf_rn(a.y, a.y, sd);
+      sd = __fmaf_rn(a.z, a.z, sd); sd = __fmaf_rn(a.w, a.w, sd);
+      sm = __fmaf_rn(b.x, b.x, sm); sm = __fmaf_rn(b.y, b.y, sm);
+      sm = __fmaf_rn(b.z, b.z, sm); sm = __fmaf_rn(b.w, b.w, sm);
+    }
+    sd = warp_sum_blend(sd);
+    sm = warp_sum_blend(sm);
+    if (lane == 0) {
+      red[0][warp] = sd;
+      red[1][warp] = sm;
+    }
+    __syncthreads();
+    sd = (red[0][0] + red[0][1]) + (red[0][2] + red[0][3]);
+    sm = (red[1][0] + red[1][1]) + (red[1][2] + red[1][3]);
+    const float rd = rsqrt_approx_f32(__fadd_rn(__fdiv_rn(sd, (float)BLEND_ONE_D), pair_eps));
+    const float rm = rsqrt_approx_f32(__fadd_rn(__fdiv_rn(sm, (float)BLEND_ONE_D), pair_eps));
+    __half2* p2 = reinterpret_cast<__half2*>(pair);
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+      const int q = tid + 128 * i;
+      if (q < n4) {
+        const float4 a = da[i], b = ma[i];
+        p2[2 * q] = __floats2half2_rn(a.x * rd, a.y * rd);
+        p2[2 * q + 1] = __floats2half2_rn(a.z * rd, a.w * rd);
+        p2[(BLEND_ONE_D >> 1) + 2 * q] = __floats2half2_rn(b.x * rm, b.y * rm);
+        p2[(BLEND_ONE_D >> 1) + 2 * q + 1] = __floats2half2_rn(b.z * rm, b.w * rm);
+      }
+    }
+    __syncthreads();
+    const uint4* pair8 = reinterpret_cast<const uint4*>(pair);
+    float a0 = 0.f, a1 = 0.f;
+#pragma unroll 6
+    for (int i = 0; i < BLEND_ONE_K8 / 32; i++) {
+      const uint4 w = __ldg(w8 + lane + 32 * i);
+      const uint4 p = pair8[lane + 32 * i];
+      const float2 w0 = h2f2_blend(w.x), p0 = h2f2_blend(p.x);
+      const float2 w1 = h2f2_blend(w.y), p1 = h2f2_blend(p.y);
+      const float2 w2 = h2f2_blend(w.z), p2_ = h2f2_blend(p.z);
+      const float2 w3 = h2f2_blend(w.w), p3 = h2f2_blend(p.w);
+      a0 = __fmaf_rn(w0.x, p0.x, a0); a1 = __fmaf_rn(w0.y, p0.y, a1);
+      a0 = __fmaf_rn(w1.x, p1.x, a0); a1 = __fmaf_rn(w1.y, p1.y, a1);
+      a0 = __fmaf_rn(w2.x, p2_.x, a0); a1 = __fmaf_rn(w2.y, p2_.y, a1);
+      a0 = __fmaf_rn(w3.x, p3.x, a0); a1 = __fmaf_rn(w3.y, p3.y, a1);
+    }
+    const float acc = warp_sum_blend(a0 + a1);
+    if (lane == 0) hidden[(int64_t)y * BLEND_ONE_R + r] = __float2half_rn(acc);
+  }
+  row_barrier_blend(counters + 2 * y, CB);
+
+  // Phase B: gain / forget dot, blend, row RMS, weight scale -> fp16 out
+  const int j = cb * BLEND_ONE_NT + tid;
+  if (tid < BLEND_ONE_R / 8) {
+    const uint4 h = __ldcg(reinterpret_cast<const uint4*>(hidden + (int64_t)y * BLEND_ONE_R) + tid);
+    float* dst = hs + 8 * tid;
+    float2 v;
+    v = h2f2_blend(h.x); dst[0] = v.x; dst[1] = v.y;
+    v = h2f2_blend(h.y); dst[2] = v.x; dst[3] = v.y;
+    v = h2f2_blend(h.z); dst[4] = v.x; dst[5] = v.y;
+    v = h2f2_blend(h.w); dst[6] = v.x; dst[7] = v.y;
+  }
+  const uint4* g8 = reinterpret_cast<const uint4*>(wgf + s * wgf_stride_s + (int64_t)j * BLEND_ONE_R);
+  const uint4* f8 = reinterpret_cast<const uint4*>(
+      wgf + s * wgf_stride_s + (int64_t)(BLEND_ONE_D + j) * BLEND_ONE_R);
+  uint4 gw[BLEND_ONE_R / 8], fw[BLEND_ONE_R / 8];
+#pragma unroll
+  for (int i = 0; i < BLEND_ONE_R / 8; i++) {
+    gw[i] = __ldg(g8 + i);
+    fw[i] = __ldg(f8 + i);
+  }
+  const float d = drow[j];
+  const float m = mrow[j];
+  __syncthreads();
+
+  float g0 = 0.f, g1 = 0.f, g2 = 0.f, g3 = 0.f;
+  float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
+  const float4* h4 = reinterpret_cast<const float4*>(hs);
+#pragma unroll
+  for (int i = 0; i < BLEND_ONE_R / 8; i++) {
+    const float4 ha = h4[2 * i], hb = h4[2 * i + 1];
+    const float2 ga = h2f2_blend(gw[i].x), gb = h2f2_blend(gw[i].y);
+    const float2 gc = h2f2_blend(gw[i].z), gd = h2f2_blend(gw[i].w);
+    const float2 fa = h2f2_blend(fw[i].x), fb = h2f2_blend(fw[i].y);
+    const float2 fc = h2f2_blend(fw[i].z), fd = h2f2_blend(fw[i].w);
+    g0 = __fmaf_rn(ga.x, ha.x, g0); g1 = __fmaf_rn(ga.y, ha.y, g1);
+    g2 = __fmaf_rn(gb.x, ha.z, g2); g3 = __fmaf_rn(gb.y, ha.w, g3);
+    f0 = __fmaf_rn(fa.x, ha.x, f0); f1 = __fmaf_rn(fa.y, ha.y, f1);
+    f2 = __fmaf_rn(fb.x, ha.z, f2); f3 = __fmaf_rn(fb.y, ha.w, f3);
+    g0 = __fmaf_rn(gc.x, hb.x, g0); g1 = __fmaf_rn(gc.y, hb.y, g1);
+    g2 = __fmaf_rn(gd.x, hb.z, g2); g3 = __fmaf_rn(gd.y, hb.w, g3);
+    f0 = __fmaf_rn(fc.x, hb.x, f0); f1 = __fmaf_rn(fc.y, hb.y, f1);
+    f2 = __fmaf_rn(fd.x, hb.z, f2); f3 = __fmaf_rn(fd.y, hb.w, f3);
+  }
+  const float gain = tanhf((g0 + g1) + (g2 + g3));
+  const float forget = tanhf((f0 + f1) + (f2 + f3));
+  const float x = __fadd_rn(__fmul_rn(__fsub_rn(1.f, forget), d), __fmul_rn(gain, m));
+  {
+    const float v = warp_sum_blend(__fmul_rn(x, x));
+    if (lane == 0) red2[warp] = v;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < BLEND_ONE_NT / 32; w++) v += red2[w];
+    partial[(int64_t)y * CB + cb] = v;
+  }
+  row_barrier_blend(counters + 2 * y + 1, CB);
+  if (warp == 0) {
+    float p = 0.f;
+    for (int c = lane; c < CB; c += 32) p += __ldcg(partial + (int64_t)y * CB + c);
+    p = warp_sum_blend(p);
+    if (lane == 0) rs1 = rsqrt_approx_f32(__fadd_rn(__fdiv_rn(p, (float)BLEND_ONE_D), eps));
+  }
+  __syncthreads();
+  const float wj = __half2float(nw[s * nw_stride_s + j]);
+  out[(int64_t)y * BLEND_ONE_D + j] = __float2half_rn(__fmul_rn(__fmul_rn(x, rs1), wj));
+}
 
 // ---- Kernel 1: Fused pair_rms_norm + down GEMV -> hidden [S, T, R] FP16 ----
 // Grid: (R / R_PER_CTA, S, num_t_tiles), Block: 192 (6 warps):
@@ -457,7 +698,10 @@ void loop_blend_sm70(
     torch::Tensor scratch_x,
     torch::Tensor scratch_sum_sq,
     torch::Tensor scratch_done,
-    double norm_eps) {
+    torch::Tensor scratch_partial,
+    torch::Tensor scratch_counters,
+    double norm_eps,
+    int64_t use_one_launch) {
   TORCH_CHECK(dest.is_cuda() && dest.dtype() == torch::kFloat32 && dest.dim() == 3);
   TORCH_CHECK(message.is_cuda() && message.dtype() == torch::kFloat32 && message.dim() == 3 &&
               message.is_contiguous());
@@ -515,6 +759,34 @@ void loop_blend_sm70(
   int32_t* sh_done = scratch_done.data_ptr<int32_t>();
   const int64_t stride_dest_s = dest.stride(0);
   const int64_t stride_w_s = norm_weight.stride(0);
+
+  // Empirically tuned on V100-SXM2: 1-launch wins 1.11x-1.20x for S*T <= 8 (e.g. S=1 T<=8, S=3 T<=2),
+  // whereas 2-launch multi-token weight sharing beats 1-launch for S*T > 8 (e.g. S=1 T=16, S=3 T>=4).
+  if (use_one_launch && D == BLEND_ONE_D && R == BLEND_ONE_R && S * T <= 8 &&
+      S * T * (BLEND_ONE_D / BLEND_ONE_NT) <= BLEND_ONE_MAX_CTAS) {
+    TORCH_CHECK(scratch_partial.numel() >= (int64_t)S * T * (BLEND_ONE_D / BLEND_ONE_NT));
+    TORCH_CHECK(scratch_counters.numel() >= (int64_t)2 * S * T);
+    const dim3 grid_one(BLEND_ONE_D / BLEND_ONE_NT, S * T);
+    k_blend_fused_one<<<grid_one, BLEND_ONE_NT, 0, st>>>(
+        dest_ptr,
+        stride_dest_s,
+        msg_ptr,
+        down_ptr,
+        down.stride(0),
+        up_ptr,
+        up.stride(0),
+        nw_ptr,
+        stride_w_s,
+        sh_hidden,
+        scratch_partial.data_ptr<float>(),
+        reinterpret_cast<unsigned*>(scratch_counters.data_ptr<int32_t>()),
+        out_ptr,
+        T,
+        1e-6f,
+        (float)norm_eps);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+    return;
+  }
 
   auto run_r = [&](auto r_tag) {
     constexpr int RC = decltype(r_tag)::value;

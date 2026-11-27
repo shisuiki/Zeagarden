@@ -26,9 +26,18 @@ _BLEND_MAX_S = 4
 _BLEND_MAX_T_CAP = 32
 
 # Per-device persistent scratch buffers (zero allocs during CUDA graph capture):
-#   (hidden[4*32*128] fp16, x[4*32*D] fp32, sum_sq[4*32] fp32 zeros, done[4*4] int32 zeros, D)
+#   (hidden, x, sum_sq, done, partial, counters, D)
 _SCRATCH: dict[
-    int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
+    int,
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ],
 ] = {}
 
 
@@ -109,11 +118,18 @@ def load_loop_blend_ext(verbose: bool = False, force_rebuild: bool = False) -> M
 
 def _get_scratch(
     device: torch.device, d: int = 2304
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     idx = device.index if device.index is not None else torch.cuda.current_device()
     entry = _SCRATCH.get(idx)
-    if entry is not None and entry[4] >= d:
-        return entry[0], entry[1], entry[2], entry[3]
+    if entry is not None and entry[6] >= d:
+        return entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "loop_blend_cuda scratch buffer was not pre-allocated before CUDA graph capture; "
@@ -124,8 +140,10 @@ def _get_scratch(
     x = torch.empty(_BLEND_MAX_S * _BLEND_MAX_T_CAP * d_alloc, dtype=torch.float32, device=device)
     sum_sq = torch.zeros(_BLEND_MAX_S * _BLEND_MAX_T_CAP, dtype=torch.float32, device=device)
     done = torch.zeros(_BLEND_MAX_S * 8, dtype=torch.int32, device=device)
-    _SCRATCH[idx] = (hidden, x, sum_sq, done, d_alloc)
-    return hidden, x, sum_sq, done
+    partial = torch.empty(64 * 18, dtype=torch.float32, device=device)
+    counters = torch.zeros(2 * 64, dtype=torch.int32, device=device)
+    _SCRATCH[idx] = (hidden, x, sum_sq, done, partial, counters, d_alloc)
+    return hidden, x, sum_sq, done, partial, counters
 
 
 def preallocate_loop_blend_scratch(
@@ -227,7 +245,10 @@ def loop_blend_cuda(
         return _loop_blend_reference_fallback(dest, message, down, up, norm_weight, norm_eps)
 
     ext = load_loop_blend_ext()
-    scratch_hidden, scratch_x, scratch_sum_sq, scratch_done = _get_scratch(message.device, d)
+    scratch_hidden, scratch_x, scratch_sum_sq, scratch_done, scratch_partial, scratch_counters = (
+        _get_scratch(message.device, d)
+    )
+    use_one = 0 if os.environ.get("INKLING_LOOP_BLEND_ONE", "1") == "0" else 1
     out = message.new_empty((num_streams, num_tokens, d), dtype=torch.float16)
     ext.loop_blend_sm70(
         dest,
@@ -240,6 +261,9 @@ def loop_blend_cuda(
         scratch_x,
         scratch_sum_sq,
         scratch_done,
+        scratch_partial,
+        scratch_counters,
         float(norm_eps),
+        int(use_one),
     )
     return out
