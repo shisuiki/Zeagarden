@@ -699,7 +699,7 @@ class Q27DFly2Speculator(BaseSpeculator):
         h_block = bufs["h_block"][:N6]
         res_f32 = bufs["res_f32"][:N6]
         x_norm = bufs["x_norm"][:N6]
-        ext.stage_a_fuse_norm(prev_hidden, eh_red, m.mtp_gate, m.mask_embedding, m.layers[0].input_ln,
+        ext.stage_a_fuse_norm(e0, eh_red, m.mtp_gate, m.mask_embedding, m.layers[0].input_ln,
                               h_block, res_f32, x_norm, EPS)
 
         # ---- Stage B: 3x bidirectional backbone layers reading target layers [47, 55, 63] KV ----

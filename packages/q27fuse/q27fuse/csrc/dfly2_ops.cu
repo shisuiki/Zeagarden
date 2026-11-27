@@ -129,7 +129,8 @@ k_extract_inputs(const int* __restrict__ qsl, const int* __restrict__ seq_lens, 
 }
 
 // =================================================================================================
-// 2. dfly2_stage_a_prep: rank-local slice of [hnorm(prev_hidden), enorm(e0)] -> [B, 2560]
+// 2. dfly2_stage_a_prep: rank-local slice of [enorm(e0), hnorm(prev_hidden)] -> [B, 2560]
+//    Matches reference_model.py::Q27MTPFusion: cat([enorm(anchor_embeds), hnorm(prev_hidden)], -1)
 // =================================================================================================
 __global__ void __launch_bounds__(256)
 k_stage_a_prep(const __half* __restrict__ prev_hidden, const __half* __restrict__ e0,
@@ -138,7 +139,7 @@ k_stage_a_prep(const __half* __restrict__ prev_hidden, const __half* __restrict_
   __shared__ float sm[8];
   const int b = blockIdx.x;
   const int tid = threadIdx.x;
-  const bool use_e = (tp_rank >= 2);
+  const bool use_e = (tp_rank < 2);
   const int col_off = (tp_rank & 1) * H_HALF;
   const __half* x = (use_e ? e0 : prev_hidden) + (int64_t)b * H_DIM;
   const __half* w = use_e ? enorm_w : hnorm_w;
@@ -162,9 +163,11 @@ k_stage_a_prep(const __half* __restrict__ prev_hidden, const __half* __restrict_
 
 // =================================================================================================
 // 3. dfly2_stage_a_fuse_norm: build h_block [B*6, 5120] + residual_f32 [B*6, 5120] + ln0(h_block)
+//    Slot 0 = anchor_emb + eh_out * gate_w (exact Q27MTPFusion, raw gate, NO sigmoid!)
+//    Slots 1..5 = mask_embedding.
 // =================================================================================================
 __global__ void __launch_bounds__(256)
-k_stage_a_fuse_norm(const __half* __restrict__ prev_hidden, const __half* __restrict__ eh_out,
+k_stage_a_fuse_norm(const __half* __restrict__ anchor_emb, const __half* __restrict__ eh_out,
                     const __half* __restrict__ gate_w, const __half* __restrict__ mask_emb,
                     const __half* __restrict__ ln0_w, __half* __restrict__ h_block,
                     float* __restrict__ res_f32, __half* __restrict__ x_norm, float eps) {
@@ -180,16 +183,15 @@ k_stage_a_fuse_norm(const __half* __restrict__ prev_hidden, const __half* __rest
 
   float ss = 0.f;
   if (s == 0) {
-    const __half2* ph = reinterpret_cast<const __half2*>(prev_hidden + (int64_t)b * H_DIM);
+    const __half2* ae = reinterpret_cast<const __half2*>(anchor_emb + (int64_t)b * H_DIM);
     const __half2* eh = reinterpret_cast<const __half2*>(eh_out + (int64_t)b * H_DIM);
     const __half2* gw = reinterpret_cast<const __half2*>(gate_w);
     for (int i = tid; i < H_DIM / 2; i += 256) {
-      const float2 p = __half22float2(ph[i]);
+      const float2 a = __half22float2(ae[i]);
       const float2 e = __half22float2(eh[i]);
       const float2 g = __half22float2(gw[i]);
-      const float g0 = sigmoid_f(g.x), g1 = sigmoid_f(g.y);
-      const float v0 = (1.0f - g0) * p.x + g0 * e.x;
-      const float v1 = (1.0f - g1) * p.y + g1 * e.y;
+      const float v0 = fmaf(e.x, g.x, a.x);
+      const float v1 = fmaf(e.y, g.y, a.y);
       const __half2 hv = __floats2half2_rn(v0, v1);
       hdst[i] = hv;
       const float2 hvf = __half22float2(hv);
