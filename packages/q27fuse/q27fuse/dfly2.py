@@ -830,16 +830,22 @@ class Q27DFly2Speculator(BaseSpeculator):
         self._bufs["prev_hidden"].zero_()
         self._bufs["req_slots"].zero_()
 
-        self._graph_pool = torch.cuda.graph_pool_handle()
-        # Capture largest first to prime pool memory cleanly
-        for b, k in sorted(pairs, key=lambda bk: (bk[0], bk[1]), reverse=True):
-            # Warmup once eagerly before capture
+        from vllm.distributed.parallel_state import graph_capture
+
+        # Eager warmup all shapes outside graph_capture so lazy workspaces and
+        # allocators settle without polluting IPC buffer registration.
+        ordered = sorted(pairs, key=lambda bk: (bk[0], bk[1]), reverse=True)
+        for b, k in ordered:
             self._run_dfly2_core(b, k, skip_attn=False)
-            torch.cuda.synchronize(self.device)
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self._graph_pool):
-                self._run_dfly2_core(b, k, skip_attn=False)
-            self._graphs[(b, k)] = g
+        torch.cuda.synchronize(self.device)
+
+        self._graph_pool = torch.cuda.graph_pool_handle()
+        with graph_capture(device=self.device, context=getattr(self, "_capture_context", None)) as ctx:
+            for b, k in ordered:
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=self._graph_pool, stream=ctx.stream):
+                    self._run_dfly2_core(b, k, skip_attn=False)
+                self._graphs[(b, k)] = g
         torch.cuda.synchronize(self.device)
         if self.tp_rank == 0:
             log.warning("q27fuse.dfly2: captured %d FULL CUDA graphs (%s)",
@@ -966,5 +972,26 @@ def apply() -> None:
 
     SD.init_speculator = init_speculator
     MR.init_speculator = init_speculator
+
+    # Disable 1Cat's EntMTP-Async per-request depth shrinkage unless explicitly requested:
+    # DFly2-KV's 3-layer backbone is block-parallel (fixed cost for all 5 slots) and Stage C
+    # is tiny (~0.15ms/slot), so shrinking K=5->3 wastes Stage B compute and clips slots 4-5.
+    if (os.environ.get("Q27_DFLY2_ADAPTIVE_MTP", "0") or "0").strip() == "0":
+        try:
+            from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+            if not getattr(AsyncScheduler, "_q27_dfly2_no_amtp", False):
+                orig_as_init = AsyncScheduler.__init__
+
+                def _dfly2_as_init(self, *args, **kwargs):
+                    orig_as_init(self, *args, **kwargs)
+                    if getattr(self, "_adaptive_mtp", False):
+                        self._adaptive_mtp = False
+                        log.warning("q27fuse.dfly2: disabled EntMTP-Async shrinkage (keeping fixed/Q27_SPEC_K depth)")
+
+                AsyncScheduler.__init__ = _dfly2_as_init
+                AsyncScheduler._q27_dfly2_no_amtp = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("q27fuse.dfly2: could not disable EntMTP-Async (%r)", e)
+
     SD._q27_dfly2_patched = True
     log.warning("q27fuse.dfly2: installed Q27DFly2Speculator hook (Q27_DFLY2_CKPT=%s)", ckpt_path())
