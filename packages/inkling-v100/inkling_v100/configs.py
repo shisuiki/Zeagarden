@@ -189,6 +189,12 @@ class Inkling2MMConfig(PreTrainedConfig):
         # Keep LM head logits in FP32 before final_logit_softcapping=30.0.
         kwargs.setdefault("head_dtype", "float32")
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        try:
+            from .conv_state import mark_inkling_config_loaded
+
+            mark_inkling_config_loaded()
+        except Exception:
+            pass
 
     def get_text_config(self, *args: Any, **kwargs: Any) -> Inkling2ModelConfig:
         return self.text_config

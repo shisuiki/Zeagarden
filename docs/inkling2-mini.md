@@ -9,8 +9,9 @@
   - `fp8_dense.cu` (offline per-channel `absmax` E4M3FN QPN8 dense attention projections + FP32-output `lm_head`, zero-copy Pass-0/Pass-1–2 slices, `KL=0.00475` vs 48-visit FP32 oracle).
   - `attn_rel_pf.cu` (`2×8` `HMMA.884` sheared relative-bias prefill, **43.7 TFLOP/s**), `attn_rel_dec.cu` (split-KV FP8 decode/verify, **94% HBM2 peak**), `attn_rel_gla.cu` (opt-in `GLA-g4 r=256` decode/verify/prefill).
   - `ep4_route.cu` (fused top-8 gate + EP4 grouping), `loop_blend.cu` (`gate_rank=64` cross-pass controller blend), `all_reduce_conv_mix.cu` (1-shot NVLink P2P AllReduce + MoE combine + `W=4` conv + FP32 AttnRes + RMSNorm).
-- **Lossless `16.2×` KV Capacity (`RingConv`)**:
-  - Under `--no-enable-prefix-caching` (default `INKLING_RING_CONV=auto`), replaces paged conv slots with a fixed 16-slot per-request FP16 ring buffer (`247.5 MiB/GPU`), reclaiming the 94% paged conv-state pool tax (`35,435 → 572,709` tokens = `17.5×` concurrent 32K requests, bit-exact).
+- **Lossless `16.2×` KV Capacity + Prefix Caching (`RingConv` + `RingAPC`)**:
+  - Under `INKLING_RING_CONV=auto` (default), replaces paged conv slots with a fixed 16-slot per-request FP16 ring buffer (`247.5 MiB/GPU`), reclaiming the 94% paged conv-state pool tax (`35,435 → 572,709` tokens @ `gpu_memory_utilization=0.85`, `1,042,203` tokens / `7.95×` @ 128K at `0.92`, bit-exact).
+  - **RingAPC** automatically activates when `--enable-prefix-caching` is enabled with `RingConv`: captures bit-exact 3-tap conv checkpoints every `INKLING_RING_APC_STRIDE` tokens (default `512`) into a lazy-allocated pinned host-RAM LRU pool (`1.41 MiB/ckpt`, `0 B` extra GPU KV groups), aligns EngineCore prefix-cache hits & SWA replay windows to stride boundaries (with DSpark lookahead awareness), and restores the 3-tap ring state on prefix hit (**`0.0` bit-exact diff**, **95–99%** hit rate & **13×** TTFT speedup at 17.6K context with full `1,042,203`-token KV pool preserved).
 - **Native DSpark + Adaptive Verify Width (`INKLING_SPEC_K="7@1,5@2,3@4"`)**:
   - Mounts `mtp.safetensors` zero-copy with CUDA-graphed draft/context-KV metadata and TP-local Markov argmax, adapting verify width `K` by active concurrency `C` so speculative decode beats both target-only (`K=0`) and fixed `K=7` across every regime.
 - **Opt-In Composable Global-KV Compression (default OFF)**:
@@ -46,7 +47,9 @@ Offline artifact generators under [`packages/inkling-v100/tools/`](../packages/i
 | `INKLING_FP8_DENSE_PATH` | `""` | Path to offline `absmax` FP8 dense safetensors (`weights/inkling2-mini/inkling2_fp8_dense_absmax.safetensors`; empty = FP16 dense). |
 | `INKLING_FP8_TIERS` | `attn,lm_head` | Dense tiers loaded in FP8 (`attn`, `lm_head`, `controllers`). |
 | `INKLING_SPEC_K` | `""` | Adaptive DSpark verify width by concurrency (recommended: `7@1,5@2,3@4`). |
-| `INKLING_RING_CONV` | `auto` | Lossless per-request ring conv buffer (`auto` enables when prefix caching is off; `0` forces paged). |
+| `INKLING_RING_CONV` | `auto` | Lossless per-request ring conv buffer (`auto`/`1` enables `RingConv`, plus `RingAPC` automatically when `--enable-prefix-caching` is on; `0` forces legacy paged conv). |
+| `INKLING_RING_APC_STRIDE` | `512` | Token checkpoint stride for `RingAPC` prefix caching (rounded up to a multiple of `lcm_block_size`). |
+| `INKLING_RING_APC_MAX_SLOTS` | `3072` | Max pinned host-RAM conv checkpoints per TP rank for `RingAPC` (lazy-allocated in 64-slot chunks, `1.41 MiB/ckpt`). |
 | `INKLING_GLA_PATH` | `""` | Opt-in calibrated `GLA-g4 r=256` projectors (`weights/inkling2-mini/inkling2_gla_g4_r256.safetensors`). |
 | `INKLING_ELR_GLOBAL_KV` | `0` | Opt-in ELR last-loop KV sharing on `L11, L17` (`1` enables; composable with `INKLING_GLA_PATH`). |
 | `INKLING_V100_EXT_DIR` | `<pkg>/_ext` | Directory for compiled CUDA extensions. |

@@ -763,6 +763,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 tail_src_toks=conv_md.tail_src_toks,
                 tail_req_slots=conv_md.tail_req_slots,
                 num_tail_writes=conv_md.num_tail_writes,
+                ckpt_dst=conv_md.layer_ckpt_dst(conv_state.ring_layer_idx),
+                ckpt_b_pos=conv_md.ckpt_b_pos,
+                ckpt_qstart=conv_md.ckpt_qstart,
+                ckpt_start_pos=conv_md.ckpt_start_pos,
+                ckpt_req_slots=conv_md.ckpt_req_slots,
+                num_ckpt_writes=conv_md.num_ckpt_writes,
             )
             c_raw = torch.mm(kv_post, w_down)
             gla_scatter_fp8_cuda(c_raw, key_cache, value_cache, md.slot_mapping)
@@ -861,6 +867,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             tail_src_toks=conv_md.tail_src_toks,
             tail_req_slots=conv_md.tail_req_slots,
             num_tail_writes=conv_md.num_tail_writes,
+            ckpt_dst=conv_md.layer_ckpt_dst(conv_state.ring_layer_idx),
+            ckpt_b_pos=conv_md.ckpt_b_pos,
+            ckpt_qstart=conv_md.ckpt_qstart,
+            ckpt_start_pos=conv_md.ckpt_start_pos,
+            ckpt_req_slots=conv_md.ckpt_req_slots,
+            num_ckpt_writes=conv_md.num_ckpt_writes,
         )
         if decode_splits:
             mixed = num_decodes < md.seq_lens.shape[0]

@@ -227,6 +227,126 @@ def ring_commit_tail(
 
 
 @triton.jit
+def _ring_capture_ckpt_kernel(
+    x_ptr,
+    stride_x,
+    cache_ptr,
+    stride_c_blk,
+    stride_c_h,
+    stride_c_n,
+    dst_ptr,
+    stride_d_c,
+    stride_d_t,
+    stride_d_h,
+    b_pos_ptr,
+    qstart_ptr,
+    start_pos_ptr,
+    req_slots_ptr,
+    num_ckpts,
+    RING_N: tl.constexpr,
+    OFF: tl.constexpr,
+    WS: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    flat_idx = tl.program_id(0)
+    ckpt_idx = flat_idx // 3
+    if ckpt_idx >= num_ckpts:
+        return
+    t_idx = flat_idx % 3  # 0 => b_pos - 2, 1 => b_pos - 1, 2 => b_pos
+    coff = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    C = H * WS
+    c_mask = coff < C
+    head = tl.minimum(coff // WS, H - 1)
+    col = OFF + (coff % WS)
+
+    b_pos = tl.load(b_pos_ptr + ckpt_idx).to(tl.int64)
+    qstart = tl.load(qstart_ptr + ckpt_idx).to(tl.int64)
+    start_pos = tl.load(start_pos_ptr + ckpt_idx).to(tl.int64)
+    req_slot = tl.load(req_slots_ptr + ckpt_idx).to(tl.int64)
+
+    tok_pos = b_pos - 2 + t_idx
+    from_x = tok_pos >= start_pos
+    x_row = tl.maximum(qstart + (tok_pos - start_pos), 0)
+    ring_pos = tok_pos & (RING_N - 1)
+
+    val_x = tl.load(
+        x_ptr + x_row * stride_x + coff,
+        mask=c_mask & from_x,
+        other=0.0,
+    ).to(dst_ptr.dtype.element_ty)
+    val_c = tl.load(
+        cache_ptr
+        + req_slot * stride_c_blk
+        + head * stride_c_h
+        + ring_pos * stride_c_n
+        + col,
+        mask=c_mask & (~from_x),
+        other=0.0,
+    ).to(dst_ptr.dtype.element_ty)
+    val = tl.where(from_x, val_x, val_c)
+
+    dst = (
+        dst_ptr
+        + ckpt_idx * stride_d_c
+        + t_idx * stride_d_t
+        + head * stride_d_h
+        + col
+    )
+    tl.store(dst, val, mask=c_mask)
+
+
+def ring_capture_ckpt(
+    x: torch.Tensor,
+    cache: torch.Tensor,
+    dst: torch.Tensor,
+    b_pos: torch.Tensor,
+    qstart: torch.Tensor,
+    start_pos: torch.Tensor,
+    req_slots: torch.Tensor,
+    num_ckpts: int,
+    stream_offset: int,
+    stream_width: int,
+) -> None:
+    """Capture 3-token [b_pos-2, b_pos-1, b_pos] conv checkpoints for one stream.
+
+    Must run BEFORE `ring_commit_tail` so any boundary near the start of a chunk
+    (`b_pos - start_pos < 2`) reads intact pre-chunk history from `cache`.
+    `dst` has shape `[max_ckpts, 3, num_heads, raw_head_size]` (or slice along layer dim).
+    """
+    if num_ckpts <= 0:
+        return
+    num_heads = cache.shape[1]
+    ring_n = cache.shape[2]
+    channels = num_heads * stream_width
+    block_c = min(triton.next_power_of_2(channels), 512)
+    grid = (num_ckpts * 3, triton.cdiv(channels, block_c))
+    _ring_capture_ckpt_kernel[grid](
+        x,
+        x.stride(0),
+        cache,
+        cache.stride(0),
+        cache.stride(1),
+        cache.stride(2),
+        dst,
+        dst.stride(0),
+        dst.stride(1),
+        dst.stride(2),
+        b_pos,
+        qstart,
+        start_pos,
+        req_slots,
+        num_ckpts,
+        RING_N=ring_n,
+        OFF=stream_offset,
+        WS=stream_width,
+        H=num_heads,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _cached_taps(
     cache_ptr,
     cache_col,
@@ -521,6 +641,12 @@ def short_conv(
     tail_src_toks: torch.Tensor | None = None,
     tail_req_slots: torch.Tensor | None = None,
     num_tail_writes: int = 0,
+    ckpt_dst: torch.Tensor | None = None,
+    ckpt_b_pos: torch.Tensor | None = None,
+    ckpt_qstart: torch.Tensor | None = None,
+    ckpt_start_pos: torch.Tensor | None = None,
+    ckpt_req_slots: torch.Tensor | None = None,
+    num_ckpt_writes: int = 0,
 ) -> torch.Tensor:
     """Static depthwise causal conv over paged conv cache; supports FP32 `out`/`addend`/`residual`."""
     num_tokens, channels = x.shape
@@ -577,6 +703,26 @@ def short_conv(
         num_warps=4,
         enable_fp_fusion=False,
     )
+    if (
+        num_ckpt_writes > 0
+        and ckpt_dst is not None
+        and ckpt_b_pos is not None
+        and ckpt_qstart is not None
+        and ckpt_start_pos is not None
+        and ckpt_req_slots is not None
+    ):
+        ring_capture_ckpt(
+            x,
+            cache,
+            ckpt_dst,
+            ckpt_b_pos,
+            ckpt_qstart,
+            ckpt_start_pos,
+            ckpt_req_slots,
+            num_ckpt_writes,
+            stream_offset,
+            stream_width,
+        )
     if num_tail_writes > 0 and tail_src_toks is not None and tail_req_slots is not None:
         ring_commit_tail(
             x,
@@ -963,6 +1109,12 @@ def attention_prologue(
     tail_src_toks: torch.Tensor | None = None,
     tail_req_slots: torch.Tensor | None = None,
     num_tail_writes: int = 0,
+    ckpt_dst: torch.Tensor | None = None,
+    ckpt_b_pos: torch.Tensor | None = None,
+    ckpt_qstart: torch.Tensor | None = None,
+    ckpt_start_pos: torch.Tensor | None = None,
+    ckpt_req_slots: torch.Tensor | None = None,
+    num_ckpt_writes: int = 0,
 ) -> None:
     num_tokens = kv_slot_mapping.shape[0]
     if num_tokens == 0:
@@ -1091,6 +1243,38 @@ def attention_prologue(
             QR_TOKENS=qr_tokens,
             num_warps=4,
             enable_fp_fusion=False,
+        )
+    if (
+        num_ckpt_writes > 0
+        and ckpt_dst is not None
+        and ckpt_b_pos is not None
+        and ckpt_qstart is not None
+        and ckpt_start_pos is not None
+        and ckpt_req_slots is not None
+    ):
+        ring_capture_ckpt(
+            k,
+            cache,
+            ckpt_dst,
+            ckpt_b_pos,
+            ckpt_qstart,
+            ckpt_start_pos,
+            ckpt_req_slots,
+            num_ckpt_writes,
+            0,
+            head_dim,
+        )
+        ring_capture_ckpt(
+            v,
+            cache,
+            ckpt_dst,
+            ckpt_b_pos,
+            ckpt_qstart,
+            ckpt_start_pos,
+            ckpt_req_slots,
+            num_ckpt_writes,
+            head_dim,
+            head_dim,
         )
     if num_tail_writes > 0 and tail_src_toks is not None and tail_req_slots is not None:
         ring_commit_tail(

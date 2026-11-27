@@ -10,7 +10,9 @@
 #   INKLING_SPEC_K="7@1,5@2,3@4"   Adaptive DSpark verify width by concurrency
 #   INKLING_GLA_PATH=<path>        Opt-in Post-Prologue GLA-g4 r=256 projectors (from tools/calibrate_gla_g4.py)
 #   INKLING_ELR_GLOBAL_KV=0        Opt-in ELR Last-Loop KV sharing on L11/L17 (set 1 to enable; composable with GLA)
-#   PREFIX_CACHING=0               Default 0 (--no-enable-prefix-caching auto-enables lossless RingConv 16.2x KV)
+#   PREFIX_CACHING=1               Default 1 (--enable-prefix-caching auto-enables lossless RingAPC on top of RingConv 16.2x KV; set 0 for --no-enable-prefix-caching)
+#   INKLING_RING_APC_STRIDE=512    Token checkpoint stride for RingAPC prefix caching
+#   INKLING_RING_APC_MAX_SLOTS=3072 Max pinned host-RAM checkpoints per TP rank for RingAPC
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-${1:-}}"
@@ -42,8 +44,10 @@ ARGS=(
   -cc.cudagraph_mode=FULL_DECODE_ONLY
 )
 
-if [ "${PREFIX_CACHING:-0}" = "0" ]; then
+if [ "${PREFIX_CACHING:-1}" = "0" ]; then
   ARGS+=(--no-enable-prefix-caching)
+else
+  ARGS+=(--enable-prefix-caching)
 fi
 
 if [ -n "${DSPARK_DIR:-}" ]; then
