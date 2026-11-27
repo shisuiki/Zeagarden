@@ -129,7 +129,14 @@ class QPN8Linear(nn.Module):
                 return out
             dispatch_channel_rows(out, x, self.codes, self.s16, self.split_k, 1, False, False, None)
             return out
-        # M > 64 (e.g. Stage B at B > 10): 64-row chunks via fp8_lin.cu (zero alloc, CUDA-graph safe)
+        # M > 64 (e.g. Stage B at B > 10): single-pass fp8_short for M >= 100 (1.21-1.35x faster),
+        # or 64-row chunks via fp8_lin.cu below 100 (zero alloc, CUDA-graph safe).
+        if m >= 100 and m <= 512 and self.in_features % 32 == 0 and self.out_features % 32 == 0:
+            from . import shortpf
+            if shortpf.SPF_FP8 and (x.data_ptr() & 15) == 0 and (out.data_ptr() & 15) == 0:
+                cfg = shortpf._pick_fp8(m, self.in_features, self.out_features)
+                shortpf.fp8_short_ext().fp8_short(x, self.codes.view(-1), self.s16.view(-1), out, cfg)
+                return out
         cfg64 = _fp8_cfg_for(64, self.in_features)
         ext = ops.fp8_ext()
         cflat = self.codes.view(-1)
@@ -158,8 +165,18 @@ class NVFP4MLP(nn.Module):
         self.epi_d = float(epi_d)
         self.ir = int(ir)
 
-    def forward(self, x: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
-        from . import ops
+    def forward(self, x: torch.Tensor, ws: torch.Tensor,
+                mid_buf: torch.Tensor | None = None, out_buf: torch.Tensor | None = None) -> torch.Tensor:
+        from . import ops, shortpf
+        m = int(x.shape[0])
+        if (m >= 169 and m <= 448 and shortpf.SPF_MLP and mid_buf is not None and out_buf is not None
+                and (x.data_ptr() & 15) == 0 and (self.wgu.data_ptr() & 15) == 0 and (self.wd.data_ptr() & 15) == 0):
+            gu_cfg, dn_cfg = shortpf._pick(shortpf.MLP_CFG, m)
+            mid = mid_buf[:m]
+            out = out_buf[:m]
+            shortpf.mlp_short_ext().mlp_short_into(x, self.wgu, self.wd, self.epi_gu, self.epi_d,
+                                                   self.ir, mid, out, gu_cfg, dn_cfg)
+            return out
         return ops.mlp_ext().mlp(x, self.wgu, self.wd, self.epi_gu, self.epi_d, self.ir, ws)
 
 
@@ -171,8 +188,9 @@ class FP8MLP(nn.Module):
         self.gate_up = gate_up
         self.down = down
 
-    def forward(self, x: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
-        del ws
+    def forward(self, x: torch.Tensor, ws: torch.Tensor,
+                mid_buf: torch.Tensor | None = None, out_buf: torch.Tensor | None = None) -> torch.Tensor:
+        del ws, mid_buf, out_buf
         m = int(x.shape[0])
         gu = torch.empty((m, self.gate_up.out_features), dtype=x.dtype, device=x.device)
         self.gate_up.forward_into(x, gu)
@@ -522,6 +540,9 @@ class Q27DFly2Speculator(BaseSpeculator):
             bufs["o_lat_b"] = torch.empty(N6, NQ_LOCAL, r_lat_max, dtype=torch.float16, device=dev)
             bufs["q_cat_c"] = torch.empty(B, NQ_LOCAL, r_lat_max + 64, dtype=torch.float16, device=dev)
             bufs["o_lat_c"] = torch.empty(B, NQ_LOCAL, r_lat_max, dtype=torch.float16, device=dev)
+        if N6 >= 169:
+            bufs["mlp_mid_b"] = torch.empty(N6, I_LOCAL, dtype=torch.float16, device=dev)
+            bufs["mlp_out_b"] = torch.empty(N6, H_DIM, dtype=torch.float16, device=dev)
         self._bufs = bufs
         self._slot_idx_tensors = [torch.tensor(i, dtype=torch.int64, device=dev) for i in range(self.num_speculative_steps)]
         if self.tp_rank == 0:
@@ -557,8 +578,13 @@ class Q27DFly2Speculator(BaseSpeculator):
     def _ensure_kv_ready(self) -> None:
         if self._kv_ready:
             return
-        from . import attnv, gla
+        from . import attnv, gla, shortpf
         attnv.workspace(self.device, 1)
+        dev_idx = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        if shortpf.SPF_FP8 and self.max_num_reqs * BLK >= 100:
+            shortpf.fp8_short_ext().init(dev_idx)
+        if shortpf.SPF_MLP and self.max_num_reqs * BLK >= 169:
+            shortpf.mlp_short_ext().init(dev_idx)
         if any(getattr(m, "_gla_active", False) for m in self.target_attn_mods):
             gla._ensure_workspace(self.device, 1)
             for m in self.target_attn_mods:
@@ -716,6 +742,8 @@ class Q27DFly2Speculator(BaseSpeculator):
         attn_out_b = bufs["attn_out_b"][:N6]
         o_part_b = bufs["o_part_b"][:N6]
         mlp_ws = ops.workspace(self.device, max(2 * I_LOCAL * H_DIM, H_DIM * I_LOCAL)) if N6 > ops.MLP_MAX else e0.new_empty(0)
+        mlp_mid_b = bufs.get("mlp_mid_b")
+        mlp_out_b = bufs.get("mlp_out_b")
 
         has_fused_arn = hasattr(torch.ops.vllm, "sm70_tp4_all_reduce_gemma_rms_norm")
         for li in range(3):
@@ -734,7 +762,7 @@ class Q27DFly2Speculator(BaseSpeculator):
             else:
                 o_red = tensor_model_parallel_all_reduce(o_part_b)
                 ext.gemma_rmsnorm_res(o_red, res_f32, layer.post_ln, x_norm, EPS)
-            mlp_part = layer.mlp(x_norm, mlp_ws)
+            mlp_part = layer.mlp(x_norm, mlp_ws, mlp_mid_b, mlp_out_b)
             next_ln = m.layers[li + 1].input_ln if li < 2 else m.final_norm
             if has_fused_arn:
                 x_norm, res_f32 = torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm(

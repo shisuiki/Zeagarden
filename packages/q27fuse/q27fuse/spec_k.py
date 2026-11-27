@@ -69,9 +69,9 @@ def ranges(cfg, K, max_reqs):
 
 
 def capture_counts(lo, hi):
-    """request counts that get a graph inside [lo, hi]: 1, 2, 3, 4, 6, 8, then every 8th, and hi (batches in between pad
-    up to the next one); one graph per count up to 64 requests ran the 64-sequence server out of memory"""
-    return sorted({b for b in range(lo, hi + 1) if b in (1, 2, 3, 4, 6, 8) or b % 8 == 0} | {hi})
+    """request counts that get a graph inside [lo, hi]: 1, 2, 3, 4, 6, 8, 12, then every 8th, and hi (batches in
+    between pad up to the next one); one graph per count up to 64 requests ran the 64-sequence server out of memory"""
+    return sorted({b for b in range(lo, hi + 1) if b in (1, 2, 3, 4, 6, 8, 12) or b % 8 == 0} | {hi})
 
 
 def apply():
