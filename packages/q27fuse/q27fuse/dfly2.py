@@ -925,7 +925,8 @@ class Q27DFly2Speculator(BaseSpeculator):
             return self.draft_tokens[:num_reqs]
 
         if is_profile or skip_attn_for_dummy_run:
-            # Memory profile / pre-KV-alloc dummy run: run core with skip_attn=True so peak memory is profiled
+            # Memory profile / pre-KV-alloc dummy run: init runtime buffers and run core with skip_attn=True
+            self._ensure_kv_ready()
             b_run = min(num_reqs, self.max_num_reqs)
             self._bufs["anchor_tok"][:b_run].zero_()
             self._bufs["ctx_len"][:b_run].zero_()
