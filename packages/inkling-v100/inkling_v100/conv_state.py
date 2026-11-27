@@ -55,7 +55,9 @@ K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
 RING_CONV_SLOTS = 16  # >= 3 (W-1 history) + 8 (max DSpark verify Q) => zero overwrite on rejection
 RING_MAX_INPLACE_LEN = 12  # 3 + 12 = 15 < 16 => provably disjoint read/write sets
 RING_APC_DEFAULT_STRIDE = 512
+RING_APC_DEFAULT_RETENTION = 4096
 RING_APC_DEFAULT_MAX_SLOTS = 3072
+RING_APC_DEFAULT_OFFLOAD_MAX_SLOTS = 6144
 RING_APC_CORE_MARGIN = 256  # EngineCore keeps a strict subset so Worker LRU never misses a hit
 RING_APC_CHUNK_SLOTS = 64
 
@@ -90,7 +92,18 @@ def ring_apc_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
-def ring_apc_max_slots() -> int:
+def _kv_offload_enabled(vllm_config: VllmConfig | None) -> bool:
+    if vllm_config is None:
+        return False
+    if getattr(vllm_config.cache_config, "kv_offloading_size", None) is not None:
+        return True
+    kv_tx = getattr(vllm_config, "kv_transfer_config", None)
+    return kv_tx is not None and bool(getattr(kv_tx, "kv_connector", None))
+
+
+def ring_apc_max_slots(
+    vllm_config: VllmConfig | None = None, *, offload_enabled: bool = False
+) -> int:
     raw = os.environ.get("INKLING_RING_APC_MAX_SLOTS", "").strip()
     if raw:
         val = int(raw)
@@ -99,7 +112,20 @@ def ring_apc_max_slots() -> int:
                 f"INKLING_RING_APC_MAX_SLOTS must be >= {RING_APC_CORE_MARGIN + 64}, got {val}"
             )
         return val
+    if offload_enabled or _kv_offload_enabled(vllm_config):
+        return RING_APC_DEFAULT_OFFLOAD_MAX_SLOTS
     return RING_APC_DEFAULT_MAX_SLOTS
+
+
+def resolve_ring_apc_retention(stride: int, reuse_window: int) -> int | None:
+    """Resolve SWA replay retention interval in tokens (`0` disables intermediate retention)."""
+    raw = os.environ.get("INKLING_RING_APC_RETENTION", "").strip()
+    req = int(raw) if raw else RING_APC_DEFAULT_RETENTION
+    if req <= 0:
+        return None
+    aligned = max(stride, ((req + stride - 1) // stride) * stride)
+    min_win = max(stride, ((reuse_window + stride - 1) // stride) * stride)
+    return max(aligned, min_win)
 
 
 def select_ring_apc_anchor_group(kv_cache_config: KVCacheConfig) -> tuple[int, int] | None:
@@ -159,7 +185,8 @@ class _RingAPCCheckpointPool:
 
     Each checkpoint has shape `[num_layers, 3, num_kv_heads, raw_head_size]` in FP16
     (~1.41 MiB per checkpoint for Inkling-2-Mini at TP=4).
-    Keyed by physical anchor-group `block_id`.
+    Supports refcounted zero-copy aliasing between GPU physical anchor `block_id`s and
+    CPU offload `block_id`s (when `OffloadingConnector` swaps KV blocks GPU <-> RAM).
     """
 
     def __init__(
@@ -182,7 +209,15 @@ class _RingAPCCheckpointPool:
         self._chunks: list[torch.Tensor] = []
         self._allocated = 0
         self._free_slots: list[int] = []
-        self._block_to_slot: OrderedDict[int, int] = OrderedDict()
+
+        # Dual key maps into shared refcounted pinned-CPU slots:
+        #   gpu_block_id -> slot_idx   (active/cached GPU physical anchor blocks)
+        #   cpu_block_id -> slot_idx   (KV-offloaded CPU anchor blocks)
+        self._gpu_to_slot: dict[int, int] = {}
+        self._cpu_to_slot: dict[int, int] = {}
+        self._slot_gpu_keys: dict[int, set[int]] = {}
+        self._slot_cpu_keys: dict[int, set[int]] = {}
+        self._slot_lru: OrderedDict[int, None] = OrderedDict()
 
         # Reusable GPU staging buffer for batched prefill capture, decode gather, and H2D restore.
         self._gpu_staging_cap = 0
@@ -205,15 +240,33 @@ class _RingAPCCheckpointPool:
         offset = slot % RING_APC_CHUNK_SLOTS
         return self._chunks[c_idx][offset]
 
-    def _alloc_slot(self, block_id: int) -> torch.Tensor:
-        existing = self._block_to_slot.get(block_id)
-        if existing is not None:
-            self._block_to_slot.move_to_end(block_id)
-            return self._slot_tensor(existing)
+    def _release_if_unreferenced(self, slot: int) -> None:
+        if not self._slot_gpu_keys.get(slot) and not self._slot_cpu_keys.get(slot):
+            self._slot_gpu_keys.pop(slot, None)
+            self._slot_cpu_keys.pop(slot, None)
+            if self._slot_lru.pop(slot, None) is not None:
+                self._free_slots.append(slot)
 
+    def _detach_gpu(self, block_id: int) -> None:
+        old = self._gpu_to_slot.pop(block_id, None)
+        if old is not None:
+            gset = self._slot_gpu_keys.get(old)
+            if gset is not None:
+                gset.discard(block_id)
+            self._release_if_unreferenced(old)
+
+    def _detach_cpu(self, cpu_block_id: int) -> None:
+        old = self._cpu_to_slot.pop(cpu_block_id, None)
+        if old is not None:
+            cset = self._slot_cpu_keys.get(old)
+            if cset is not None:
+                cset.discard(cpu_block_id)
+            self._release_if_unreferenced(old)
+
+    def _alloc_fresh_slot(self) -> int:
         if self._free_slots:
-            slot = self._free_slots.pop()
-        elif self._allocated < self.max_slots:
+            return self._free_slots.pop()
+        if self._allocated < self.max_slots:
             chunk_n = min(RING_APC_CHUNK_SLOTS, self.max_slots - self._allocated)
             chunk = torch.empty(
                 (chunk_n, self.num_layers, 3, self.num_kv_heads, self.raw_head_size),
@@ -226,30 +279,86 @@ class _RingAPCCheckpointPool:
             slot = base
             if chunk_n > 1:
                 self._free_slots.extend(range(base + chunk_n - 1, base, -1))
-        else:
-            _, slot = self._block_to_slot.popitem(last=False)
+            return slot
+        # Evict oldest slot in LRU order and detach all GPU/CPU keys referencing it.
+        slot, _ = self._slot_lru.popitem(last=False)
+        for gid in self._slot_gpu_keys.pop(slot, ()):
+            self._gpu_to_slot.pop(gid, None)
+        for cid in self._slot_cpu_keys.pop(slot, ()):
+            self._cpu_to_slot.pop(cid, None)
+        return slot
 
-        self._block_to_slot[block_id] = slot
-        return self._slot_tensor(slot)
+    def _attach_gpu(self, block_id: int, slot: int) -> None:
+        self._gpu_to_slot[block_id] = slot
+        self._slot_gpu_keys.setdefault(slot, set()).add(block_id)
+        self._slot_lru[slot] = None
+        self._slot_lru.move_to_end(slot)
+
+    def _attach_cpu(self, cpu_block_id: int, slot: int) -> None:
+        self._cpu_to_slot[cpu_block_id] = slot
+        self._slot_cpu_keys.setdefault(slot, set()).add(cpu_block_id)
+        self._slot_lru[slot] = None
+        self._slot_lru.move_to_end(slot)
 
     def has(self, block_id: int) -> bool:
-        return block_id in self._block_to_slot
+        return block_id in self._gpu_to_slot
+
+    def has_cpu(self, cpu_block_id: int) -> bool:
+        return cpu_block_id in self._cpu_to_slot
 
     def get(self, block_id: int) -> torch.Tensor | None:
-        slot = self._block_to_slot.get(block_id)
+        slot = self._gpu_to_slot.get(block_id)
         if slot is None:
             return None
-        self._block_to_slot.move_to_end(block_id)
+        self._slot_lru.move_to_end(slot)
         return self._slot_tensor(slot)
 
     def put_from_gpu(self, block_id: int, gpu_tensor: torch.Tensor) -> None:
-        dst = self._alloc_slot(block_id)
+        # Reuse the current slot in-place ONLY if exclusively owned by `block_id`.
+        cur = self._gpu_to_slot.get(block_id)
+        if (
+            cur is not None
+            and len(self._slot_gpu_keys.get(cur, ())) == 1
+            and not self._slot_cpu_keys.get(cur)
+        ):
+            slot = cur
+            self._slot_lru.move_to_end(slot)
+        else:
+            self._detach_gpu(block_id)
+            slot = self._alloc_fresh_slot()
+            self._attach_gpu(block_id, slot)
         # Blocking D2H only when committing checkpoints (stride crossings are rare;
         # ~0.12 ms per 1.4 MiB checkpoint) so staging buffer is immediately safe to reuse.
-        dst.copy_(gpu_tensor, non_blocking=False)
+        self._slot_tensor(slot).copy_(gpu_tensor, non_blocking=False)
+
+    def bind_gpu_to_cpu(self, gpu_block_id: int, cpu_block_id: int) -> bool:
+        """Zero-copy alias: attach a CPU offload block ID to the same pinned slot as `gpu_block_id`."""
+        slot = self._gpu_to_slot.get(gpu_block_id)
+        if slot is None:
+            self._detach_cpu(cpu_block_id)
+            return False
+        if self._cpu_to_slot.get(cpu_block_id) == slot:
+            self._slot_lru.move_to_end(slot)
+            return True
+        self._detach_cpu(cpu_block_id)
+        self._attach_cpu(cpu_block_id, slot)
+        return True
+
+    def bind_cpu_to_gpu(self, cpu_block_id: int, gpu_block_id: int) -> bool:
+        """Zero-copy alias: attach a freshly allocated GPU block ID to the CPU offload's pinned slot."""
+        slot = self._cpu_to_slot.get(cpu_block_id)
+        if slot is None:
+            self._detach_gpu(gpu_block_id)
+            return False
+        if self._gpu_to_slot.get(gpu_block_id) == slot:
+            self._slot_lru.move_to_end(slot)
+            return True
+        self._detach_gpu(gpu_block_id)
+        self._attach_gpu(gpu_block_id, slot)
+        return True
 
     def __len__(self) -> int:
-        return len(self._block_to_slot)
+        return len(self._slot_lru)
 
 
 class _RingConvRuntime:
@@ -261,12 +370,16 @@ class _RingConvRuntime:
         max_num_tokens: int,
         device: torch.device,
         apc_enabled: bool = False,
+        apc_max_slots: int | None = None,
     ) -> None:
         self.max_num_seqs = max_num_seqs
         self.dummy_slot = max_num_seqs
         self.max_num_tokens = max_num_tokens
         self.device = device
         self.apc_enabled = apc_enabled
+        self._apc_max_slots = (
+            apc_max_slots if apc_max_slots is not None else ring_apc_max_slots()
+        )
 
         self.block_table_buf = torch.full(
             (max_num_seqs, 1), self.dummy_slot, dtype=torch.int32, device=device
@@ -338,7 +451,7 @@ class _RingConvRuntime:
                 num_kv_heads=first.kv_cache.shape[1],
                 raw_head_size=first.kv_cache.shape[3],
                 dtype=first.kv_cache.dtype,
-                max_slots=ring_apc_max_slots(),
+                max_slots=self._apc_max_slots,
                 device=self.device,
             )
             if not self._apc_logged:
@@ -651,16 +764,17 @@ def _ensure_ring_runtime(vllm_config: VllmConfig, device: torch.device) -> _Ring
             max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
             device=device,
             apc_enabled=ring_apc_enabled(vllm_config),
+            apc_max_slots=ring_apc_max_slots(vllm_config),
         )
         _RING_RUNTIME_BY_DEV[device] = rt
     return rt
 
 
 class _RingAPCCoreTracker:
-    """EngineCore-side stride-aligned prefix checkpoint tracker.
+    """EngineCore-side stride-aligned prefix checkpoint tracker (GPU + optional CPU offload).
 
-    Mirrors the set of anchor-group physical block IDs whose conv checkpoints are
-    guaranteed to be resident in every TP worker's `_RingAPCCheckpointPool`.
+    Mirrors anchor-group physical GPU `block_id`s and CPU offload `OffloadKey`s whose
+    conv checkpoints are guaranteed resident in every TP worker's `_RingAPCCheckpointPool`.
     """
 
     def __init__(
@@ -675,28 +789,57 @@ class _RingAPCCoreTracker:
         self.stride_tokens = stride_tokens
         self.stride_blocks = stride_tokens // anchor_bs
         self.max_slots = max(64, max_slots - RING_APC_CORE_MARGIN)
-        self.valid_blocks: OrderedDict[int, None] = OrderedDict()
+        # Unified conservative LRU tracking both ("gpu", block_id) and ("cpu", offload_key)
+        self._live: OrderedDict[tuple[str, object], None] = OrderedDict()
+
+    def raise_max_slots(self, worker_max_slots: int) -> None:
+        self.max_slots = max(self.max_slots, max(64, worker_max_slots - RING_APC_CORE_MARGIN))
+
+    def _insert(self, tag: str, key: object) -> None:
+        k = (tag, key)
+        if k in self._live:
+            self._live.move_to_end(k)
+            return
+        while len(self._live) >= self.max_slots:
+            self._live.popitem(last=False)
+        self._live[k] = None
 
     def on_block_cached(self, group_id: int, logical_block_idx: int, block_id: int) -> None:
         if group_id != self.anchor_gid:
             return
         if (logical_block_idx + 1) % self.stride_blocks != 0:
             return
-        if block_id in self.valid_blocks:
-            self.valid_blocks.move_to_end(block_id)
-            return
-        if len(self.valid_blocks) >= self.max_slots:
-            self.valid_blocks.popitem(last=False)
-        self.valid_blocks[block_id] = None
+        self._insert("gpu", block_id)
 
     def on_block_evicted(self, block_id: int) -> None:
-        self.valid_blocks.pop(block_id, None)
+        self._live.pop(("gpu", block_id), None)
 
     def has_and_touch(self, block_id: int) -> bool:
-        if block_id not in self.valid_blocks:
+        k = ("gpu", block_id)
+        if k not in self._live:
             return False
-        self.valid_blocks.move_to_end(block_id)
+        self._live.move_to_end(k)
         return True
+
+    def on_cpu_key_stored(self, offload_key: object) -> None:
+        self._insert("cpu", offload_key)
+
+    def on_cpu_key_evicted(self, offload_key: object) -> None:
+        self._live.pop(("cpu", offload_key), None)
+
+    def has_and_touch_cpu(self, offload_key: object) -> bool:
+        k = ("cpu", offload_key)
+        if k not in self._live:
+            return False
+        self._live.move_to_end(k)
+        return True
+
+    def clear_cpu_keys(self) -> None:
+        for k in [key for key in self._live if key[0] == "cpu"]:
+            self._live.pop(k, None)
+
+
+_ACTIVE_CORE_TRACKER: _RingAPCCoreTracker | None = None
 
 
 def _is_inkling_ring_apc_kv_config(kv_cache_config: KVCacheConfig) -> bool:
@@ -730,24 +873,29 @@ def _install_ring_apc_engine_core_hooks() -> None:
     orig_mgr_init = KVCacheManager.__init__
 
     def _wrapped_mgr_init(self, *args, **kwargs):
+        global _ACTIVE_CORE_TRACKER
         orig_mgr_init(self, *args, **kwargs)
         if self.enable_caching and _is_inkling_ring_apc_kv_config(self.kv_cache_config):
             anchor = select_ring_apc_anchor_group(self.kv_cache_config)
             if anchor is not None:
                 anchor_gid, anchor_bs = anchor
                 stride = resolve_ring_apc_stride(self.kv_cache_config)
-                tracker = _RingAPCCoreTracker(
-                    anchor_gid=anchor_gid,
-                    anchor_bs=anchor_bs,
-                    stride_tokens=stride,
-                    max_slots=ring_apc_max_slots(),
-                )
+                tracker = _ACTIVE_CORE_TRACKER
+                if tracker is None or tracker.anchor_gid != anchor_gid:
+                    tracker = _RingAPCCoreTracker(
+                        anchor_gid=anchor_gid,
+                        anchor_bs=anchor_bs,
+                        stride_tokens=stride,
+                        max_slots=ring_apc_max_slots(),
+                    )
+                    _ACTIVE_CORE_TRACKER = tracker
                 self.coordinator._inkling_ring_apc_tracker = tracker
                 self.block_pool._inkling_ring_apc_tracker = tracker
                 # Align SWA managers to RingAPC's stride and retain SWA replay windows
                 # in normal LRU (instead of eager `reuse_first=True` recycling) so
-                # stride-aligned prompt ends, multi-turn reply ends, and branching
-                # shared prefixes all hit at the maximum theoretical prefix length.
+                # stride-aligned prompt ends, multi-turn reply ends, and periodic
+                # branching prefixes all hit while preserving high multi-session capacity.
+                retention_logged: int | None = None
                 for mgr in getattr(self.coordinator, "single_type_managers", ()):
                     if hasattr(mgr, "alignment_tokens"):
                         mgr.alignment_tokens = stride
@@ -759,18 +907,17 @@ def _install_ring_apc_engine_core_hooks() -> None:
                             hasattr(mgr, "retention_interval")
                             and mgr.retention_interval is None
                         ):
-                            win_tok = int(reuse_win)
-                            mgr.retention_interval = max(
-                                stride, ((win_tok + stride - 1) // stride) * stride
-                            )
+                            retention = resolve_ring_apc_retention(stride, int(reuse_win))
+                            mgr.retention_interval = retention
+                            retention_logged = retention
                 log.info(
-                    "Inkling2 RingAPC EngineCore enabled: stride=%d tok, anchor_group=%d (bs=%d), "
-                    "core_tracked_slots=%d (worker_max=%d).",
+                    "Inkling2 RingAPC EngineCore enabled: stride=%d tok, retention=%s tok, "
+                    "anchor_group=%d (bs=%d), core_tracked_slots=%d.",
                     stride,
+                    retention_logged,
                     anchor_gid,
                     anchor_bs,
                     tracker.max_slots,
-                    ring_apc_max_slots(),
                 )
 
     _wrapped_mgr_init._inkling_ring_apc = True  # type: ignore[attr-defined]
@@ -891,6 +1038,197 @@ def _install_ring_apc_engine_core_hooks() -> None:
 
     _wrap_find_longest(HybridKVCacheCoordinator)
     _wrap_find_longest(UnitaryKVCacheCoordinator)
+    _install_ring_apc_offload_scheduler_hooks()
+
+
+def _install_ring_apc_offload_scheduler_hooks() -> None:
+    """Hook OffloadingConnectorScheduler so CPU-RAM KV offload aligns with RingAPC."""
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
+        from vllm.v1.kv_offload.base import get_offload_group_idx
+    except ImportError:
+        return
+
+    if getattr(OffloadingConnectorScheduler.__init__, "_inkling_ring_apc", False):
+        return
+
+    orig_sched_init = OffloadingConnectorScheduler.__init__
+    orig_lookup = OffloadingConnectorScheduler._lookup
+    orig_build_meta = OffloadingConnectorScheduler.build_connector_meta
+    orig_reset_cache = OffloadingConnectorScheduler.reset_cache
+
+    def _wrapped_sched_init(self, spec):
+        global _ACTIVE_CORE_TRACKER
+        orig_sched_init(self, spec)
+        if not _is_inkling_ring_apc_kv_config(spec.kv_cache_config):
+            return
+        anchor = select_ring_apc_anchor_group(spec.kv_cache_config)
+        if anchor is None:
+            return
+        anchor_gid, anchor_bs = anchor
+        stride = resolve_ring_apc_stride(spec.kv_cache_config)
+        worker_max = ring_apc_max_slots(spec.vllm_config, offload_enabled=True)
+        tracker = _ACTIVE_CORE_TRACKER
+        if tracker is None or tracker.anchor_gid != anchor_gid:
+            tracker = _RingAPCCoreTracker(
+                anchor_gid=anchor_gid,
+                anchor_bs=anchor_bs,
+                stride_tokens=stride,
+                max_slots=worker_max,
+            )
+            _ACTIVE_CORE_TRACKER = tracker
+        else:
+            tracker.raise_max_slots(worker_max)
+        self._inkling_ring_apc_tracker = tracker
+        # Native OffloadingConnectorScheduler._lookup honors `_mamba_align_size` by
+        # rounding external hits down to multiples of `stride` and re-verifying all
+        # sliding-window groups at the aligned boundary.
+        self._mamba_align_size = stride
+        # Align SWA offload pruning with RingAPC's retention interval (default 4096 tok):
+        # skips storing unreachable middle SWA blocks (~75% SWA RAM reduction), expanding
+        # 64 GiB CPU offload capacity from ~618K to ~1.46M unique tokens.
+        new_cfgs = []
+        changed = False
+        for gcfg in self.config.kv_group_configs:
+            sw_blks = gcfg.sliding_window_size_in_blocks
+            if sw_blks is not None and gcfg.alignment_block_count is None:
+                ret = resolve_ring_apc_retention(stride, sw_blks * gcfg.offloaded_block_size)
+                if ret is not None and ret > sw_blks * gcfg.offloaded_block_size:
+                    per_seg = ret // gcfg.offloaded_block_size
+                    if per_seg > sw_blks:
+                        gcfg = gcfg._replace(alignment_block_count=per_seg)
+                        changed = True
+            new_cfgs.append(gcfg)
+        if changed:
+            self.config = self.config._replace(kv_group_configs=tuple(new_cfgs))
+            self._group_config_by_idx = {
+                group.group_idx: group for group in self.config.kv_group_configs
+            }
+
+        # Wrap `manager.prepare_store` to mirror CPU-RAM evictions into `_RingAPCCoreTracker`.
+        mgr = self.manager
+        if not getattr(mgr, "_inkling_ring_apc_wrapped", False):
+            orig_prepare_store = mgr.prepare_store
+
+            def _wrapped_prepare_store(keys, req_context):
+                out = orig_prepare_store(keys, req_context)
+                if out is not None and out.evicted_keys:
+                    for key in out.evicted_keys:
+                        if get_offload_group_idx(key) == tracker.anchor_gid:
+                            tracker.on_cpu_key_evicted(key)
+                return out
+
+            mgr.prepare_store = _wrapped_prepare_store
+            mgr._inkling_ring_apc_wrapped = True
+
+        log.info(
+            "Inkling2 RingAPC CPU-Offload enabled: stride=%d tok, anchor_group=%d (bs=%d), "
+            "cpu_blocks=%s, core_tracked_slots=%d (worker_max=%d).",
+            stride,
+            anchor_gid,
+            anchor_bs,
+            getattr(spec, "num_blocks", "?"),
+            tracker.max_slots,
+            worker_max,
+        )
+
+    def _wrapped_lookup(self, req_status):
+        num_hit = orig_lookup(self, req_status)
+        tracker: _RingAPCCoreTracker | None = getattr(self, "_inkling_ring_apc_tracker", None)
+        if tracker is None or num_hit is None or num_hit <= 0:
+            return num_hit
+        served = req_status.num_locally_computed_tokens + num_hit
+        if served % tracker.stride_tokens != 0:
+            return 0
+        blk_idx = (served // tracker.anchor_bs) - 1
+        anchor_keys = req_status.group_states[tracker.anchor_gid].offload_keys
+        if 0 <= blk_idx < len(anchor_keys) and tracker.has_and_touch_cpu(anchor_keys[blk_idx]):
+            return num_hit
+        return 0
+
+    def _wrapped_build_meta(self, scheduler_output):
+        meta = orig_build_meta(self, scheduler_output)
+        tracker: _RingAPCCoreTracker | None = getattr(self, "_inkling_ring_apc_tracker", None)
+        if tracker is not None and getattr(meta, "store_jobs", None):
+            gid = tracker.anchor_gid
+            sblks = tracker.stride_blocks
+            for job_id, entry in meta.store_jobs.items():
+                job_status = self._jobs.get(job_id)
+                req_status = self._req_status.get(entry.req_id)
+                if job_status is None or req_status is None:
+                    continue
+                job_keys = job_status.keys
+                anchor_keys = req_status.group_states[gid].offload_keys
+                for b_idx in range(sblks - 1, len(anchor_keys), sblks):
+                    key = anchor_keys[b_idx]
+                    if key in job_keys:
+                        tracker.on_cpu_key_stored(key)
+        return meta
+
+    def _wrapped_reset_cache(self):
+        tracker: _RingAPCCoreTracker | None = getattr(self, "_inkling_ring_apc_tracker", None)
+        if tracker is not None:
+            tracker.clear_cpu_keys()
+        return orig_reset_cache(self)
+
+    _wrapped_sched_init._inkling_ring_apc = True  # type: ignore[attr-defined]
+    OffloadingConnectorScheduler.__init__ = _wrapped_sched_init
+    OffloadingConnectorScheduler._lookup = _wrapped_lookup
+    OffloadingConnectorScheduler.build_connector_meta = _wrapped_build_meta
+    OffloadingConnectorScheduler.reset_cache = _wrapped_reset_cache
+
+
+def _install_ring_apc_offload_worker_hooks() -> None:
+    """Hook OffloadingWorker.transfer_async to alias GPU <-> CPU conv checkpoint slots zero-copy."""
+    try:
+        from vllm.v1.kv_offload.worker.worker import OffloadingWorker
+    except ImportError:
+        return
+
+    if getattr(OffloadingWorker.transfer_async, "_inkling_ring_apc", False):
+        return
+
+    orig_transfer_async = OffloadingWorker.transfer_async
+
+    def _wrapped_transfer_async(self, job_id: int, transfer_spec):
+        if _RING_RUNTIME_BY_DEV and torch.cuda.is_available():
+            dev = torch.device("cuda", torch.cuda.current_device())
+            rt = _RING_RUNTIME_BY_DEV.get(dev)
+            if (
+                rt is not None
+                and rt.apc_enabled
+                and rt._apc_pool is not None
+                and rt._anchor_gid is not None
+            ):
+                src_spec, dst_spec = transfer_spec
+                src_gs = getattr(src_spec, "group_sizes", None)
+                dst_gs = getattr(dst_spec, "group_sizes", None)
+                gid = rt._anchor_gid
+                pool = rt._apc_pool
+                if src_gs is not None and dst_gs is None and gid < len(src_gs):
+                    # GPU -> CPU store: bind CPU offload block IDs to existing pinned slots.
+                    cnt = int(src_gs[gid])
+                    if cnt > 0 and len(src_spec.block_ids) == len(dst_spec.block_ids):
+                        off = sum(int(x) for x in src_gs[:gid])
+                        g_ids = src_spec.block_ids[off : off + cnt]
+                        c_ids = dst_spec.block_ids[off : off + cnt]
+                        for g_id, c_id in zip(g_ids, c_ids):
+                            pool.bind_gpu_to_cpu(int(g_id), int(c_id))
+                elif dst_gs is not None and src_gs is None and gid < len(dst_gs):
+                    # CPU -> GPU load: bind freshly allocated GPU block IDs to offloaded slots.
+                    cnt = int(dst_gs[gid])
+                    if cnt > 0 and len(src_spec.block_ids) == len(dst_spec.block_ids):
+                        off = sum(int(x) for x in dst_gs[:gid])
+                        c_ids = src_spec.block_ids[off : off + cnt]
+                        g_ids = dst_spec.block_ids[off : off + cnt]
+                        for c_id, g_id in zip(c_ids, g_ids):
+                            pool.bind_cpu_to_gpu(int(c_id), int(g_id))
+        return orig_transfer_async(self, job_id, transfer_spec)
+
+    _wrapped_transfer_async._inkling_ring_apc = True  # type: ignore[attr-defined]
+    OffloadingWorker.transfer_async = _wrapped_transfer_async
 
 
 def install_ring_conv_hook() -> None:
@@ -899,6 +1237,7 @@ def install_ring_conv_hook() -> None:
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
     _install_ring_apc_engine_core_hooks()
+    _install_ring_apc_offload_worker_hooks()
 
     if getattr(DefaultModelState.prepare_attn, "_inkling_ring_conv", False):
         return

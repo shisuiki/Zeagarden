@@ -11,8 +11,10 @@
 #   INKLING_GLA_PATH=<path>        Opt-in Post-Prologue GLA-g4 r=256 projectors (from tools/calibrate_gla_g4.py)
 #   INKLING_ELR_GLOBAL_KV=0        Opt-in ELR Last-Loop KV sharing on L11/L17 (set 1 to enable; composable with GLA)
 #   PREFIX_CACHING=1               Default 1 (--enable-prefix-caching auto-enables lossless RingAPC on top of RingConv 16.2x KV; set 0 for --no-enable-prefix-caching)
+#   KV_OFFLOAD_GB=0                Optional native Host RAM KV cache tier in GiB (e.g. 64 => --kv-offloading-backend native --kv-offloading-size 64)
 #   INKLING_RING_APC_STRIDE=512    Token checkpoint stride for RingAPC prefix caching
-#   INKLING_RING_APC_MAX_SLOTS=3072 Max pinned host-RAM checkpoints per TP rank for RingAPC
+#   INKLING_RING_APC_RETENTION=4096 SWA replay-window retention interval in tokens (0 = tail windows only)
+#   INKLING_RING_APC_MAX_SLOTS=3072 Max pinned host-RAM checkpoints per TP rank (auto-6144 when KV_OFFLOAD_GB > 0)
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-${1:-}}"
@@ -54,6 +56,10 @@ fi
 VLLM_VER="$(python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || true)"
 if [[ "$VLLM_VER" == 1.5.4* ]]; then
   ARGS+=(--no-split-mtp-phase-pure)
+fi
+
+if [ "${KV_OFFLOAD_GB:-0}" != "0" ]; then
+  ARGS+=(--kv-offloading-backend native --kv-offloading-size "${KV_OFFLOAD_GB}")
 fi
 
 if [ -n "${DSPARK_DIR:-}" ]; then

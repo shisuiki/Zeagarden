@@ -204,6 +204,24 @@ def test_ring_apc_bit_exact_prefill_and_chunk_boundary():
     out_e = run_chunk("reqE", 0, 512, 100, bt_d)
     torch.testing.assert_close(out_e, ref_out[512:612], atol=0.0, rtol=0.0)
 
+    # 6. Simulate GPU -> CPU RAM offload -> GPU block eviction/overwrite -> CPU -> new GPU block reload!
+    pool = rt._apc_pool
+    assert pool is not None
+    orig_gpu_id = 100 + (511 // anchor_bs)  # 115 (from reqA's H=512 boundary)
+    cpu_offload_id = 9001
+    assert pool.bind_gpu_to_cpu(orig_gpu_id, cpu_offload_id)
+    # Overwrite orig_gpu_id on GPU with garbage (simulating GPU eviction & reuse by another request)
+    pool.put_from_gpu(orig_gpu_id, torch.full((1, 3, num_heads, raw_head_size), 9.0, dtype=torch.float16, device=dev))
+    # Reload CPU offload block 9001 into a brand-new GPU block ID 555!
+    new_gpu_id = 555
+    assert pool.bind_cpu_to_gpu(cpu_offload_id, new_gpu_id)
+    bt_reloaded = torch.arange(540, 540 + 64, dtype=torch.int32, device=dev).unsqueeze(0)
+    assert int(bt_reloaded[0, 511 // anchor_bs].item()) == new_gpu_id
+    layer.kv_cache.zero_()
+    rt.on_add_request(2, 512)
+    out_reloaded = run_chunk("reqF_cpu_reload", 2, 512, 160, bt_reloaded)
+    torch.testing.assert_close(out_reloaded, ref_out[512:672], atol=0.0, rtol=0.0)
+
 
 def test_ring_apc_core_tracker_alignment_and_eviction():
     tracker = _RingAPCCoreTracker(anchor_gid=20, anchor_bs=32, stride_tokens=512, max_slots=320)
@@ -220,9 +238,14 @@ def test_ring_apc_core_tracker_alignment_and_eviction():
     tracker.on_block_cached(20, 15, 42)
     assert tracker.has_and_touch(42)
 
-    # Eviction removes it cleanly
+    # CPU offload key survives GPU block eviction and is removed on CPU eviction
+    cpu_key = b"fakehash12345678\x00\x00\x00\x14"
+    tracker.on_cpu_key_stored(cpu_key)
     tracker.on_block_evicted(42)
     assert not tracker.has_and_touch(42)
+    assert tracker.has_and_touch_cpu(cpu_key)
+    tracker.on_cpu_key_evicted(cpu_key)
+    assert not tracker.has_and_touch_cpu(cpu_key)
 
     # LRU evicts oldest once max_slots (64) is exceeded, preserving touched hot entry
     for i in range(64):
