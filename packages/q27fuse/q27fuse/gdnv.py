@@ -96,8 +96,8 @@ def rec_bytes() -> int:
 VERIFY_CFG = [(1, 2), (2, 3), (10 ** 9, 2)]                         # (max B, cfg)
 VERIFY_BA_CFG = [(10 ** 9, 4)]                                       # > 32 rows (b/a operands: >= 8 warps)
 DECODE_CFG = [(10 ** 9, 2)]                                          # (b/a operands: >= 4 warps)
-VERIFY_TM = {1: 2, 2: 2, 3: 3, 4: 4, 5: 5, 6: 8, 7: 8, 8: 8}        # tokens per request -> template capacity
-BA_TM = {1: 2, 2: 2, 3: 4, 4: 4, 5: 5}
+VERIFY_TM = {1: 2, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 8, 8: 8}        # tokens per request -> template capacity
+BA_TM = {1: 2, 2: 2, 3: 4, 4: 4, 5: 5, 6: 6}
 BA_CFGS = (3, 4)
 
 

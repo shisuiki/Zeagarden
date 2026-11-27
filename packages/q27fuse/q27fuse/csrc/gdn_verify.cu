@@ -642,6 +642,7 @@ bool dispatch(int mode, int tm, int cfg, const Args& a, cudaStream_t st) {
         case 3: return dispatch_cfg<3, VERIFY>(cfg, a, st);
         case 4: return dispatch_cfg<4, VERIFY>(cfg, a, st);
         case 5: return dispatch_cfg<5, VERIFY>(cfg, a, st);
+        case 6: return dispatch_cfg<6, VERIFY>(cfg, a, st);
         case 8: return dispatch_cfg<8, VERIFY>(cfg, a, st);
       }
       return false;
@@ -649,7 +650,7 @@ bool dispatch(int mode, int tm, int cfg, const Args& a, cudaStream_t st) {
 #define GDNV_BA(TM_) \
   if (tm == TM_) { if (cfg == 3) { launch<8, 8, TM_, VERIFY_BA>(a, st); return true; } \
                    if (cfg == 4) { launch<8, 16, TM_, VERIFY_BA>(a, st); return true; } return false; }
-      GDNV_BA(2) GDNV_BA(4) GDNV_BA(5)
+      GDNV_BA(2) GDNV_BA(4) GDNV_BA(5) GDNV_BA(6)
 #undef GDNV_BA
       return false;
     case 2:   // DECODE
