@@ -400,16 +400,13 @@ def _argmax_chunk_kernel(
     tl.store(PART_I + row * n_chunks + chunk, id_base + chunk * CHUNK + idx)
 
 
-def shard_argmax(
+def shard_argmax_parts(
     logits: torch.Tensor,
     softcap: float | None,
     num_valid: int,
     id_base: int,
-    rank: int,
-    world: int,
-    all_reduce,
-) -> torch.Tensor:
-    """Shard-local greedy argmax over raw FP32 `(rows, shard)` logits without vocab all-gather."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local `(part_v, part_i)` chunks for greedy argmax over `(rows, shard)` logits."""
     rows, shard = logits.shape
     assert logits.stride(1) == 1 and id_base + shard < (1 << 18)
     n_chunks = triton.cdiv(shard, ARGMAX_CHUNK)
@@ -429,6 +426,20 @@ def shard_argmax(
             HAS_CAP=softcap is not None,
             num_warps=4,
         )
+    return part_v, part_i
+
+
+def shard_argmax(
+    logits: torch.Tensor,
+    softcap: float | None,
+    num_valid: int,
+    id_base: int,
+    rank: int,
+    world: int,
+    all_reduce,
+) -> torch.Tensor:
+    """Shard-local greedy argmax over raw FP32 `(rows, shard)` logits without vocab all-gather."""
+    part_v, part_i = shard_argmax_parts(logits, softcap, num_valid, id_base)
     packed = pick_pack(part_v, part_i, rank, world)
     if world > 1:
         packed = all_reduce(packed)
@@ -496,7 +507,7 @@ def _sample_slot_chunk_kernel(
     tl.store(PART_I + row * n_chunks + chunk, id_base + chunk * CHUNK + idx)
 
 
-def shard_sample_slot(
+def shard_sample_slot_parts(
     logits: torch.Tensor,
     req_slots: torch.Tensor,
     anchor_pos: torch.Tensor,
@@ -508,17 +519,9 @@ def shard_sample_slot(
     softcap: float | None,
     num_valid: int,
     id_base: int,
-    rank: int,
-    world: int,
     use_fp64: bool,
-    all_reduce,
-) -> torch.Tensor:
-    """Shard-local softcap + temperature + Gumbel-max sampling for one DFly2 draft slot.
-
-    Zero vocab all-gather, 100% CUDA-graph safe, handles mixed T=0 and T>0 batches,
-    and writes processed local logits into `dense_local[(rs * num_spec + step), :]`
-    for zero-all-gather `shard_rejection_sample`.
-    """
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local `(part_v, part_i)` chunks + write `dense_local` for one DFly2 draft slot."""
     rows, shard = logits.shape
     assert logits.stride(1) == 1 and id_base + shard < (1 << 18)
     n_chunks = triton.cdiv(shard, ARGMAX_CHUNK)
@@ -553,6 +556,46 @@ def shard_sample_slot(
             USE_FP64=use_fp64,
             num_warps=4,
         )
+    return part_v, part_i
+
+
+def shard_sample_slot(
+    logits: torch.Tensor,
+    req_slots: torch.Tensor,
+    anchor_pos: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    dense_local: torch.Tensor | None,
+    step: int,
+    num_spec: int,
+    softcap: float | None,
+    num_valid: int,
+    id_base: int,
+    rank: int,
+    world: int,
+    use_fp64: bool,
+    all_reduce,
+) -> torch.Tensor:
+    """Shard-local softcap + temperature + Gumbel-max sampling for one DFly2 draft slot.
+
+    Zero vocab all-gather, 100% CUDA-graph safe, handles mixed T=0 and T>0 batches,
+    and writes processed local logits into `dense_local[(rs * num_spec + step), :]`
+    for zero-all-gather `shard_rejection_sample`.
+    """
+    part_v, part_i = shard_sample_slot_parts(
+        logits,
+        req_slots,
+        anchor_pos,
+        temperature,
+        seeds,
+        dense_local,
+        step,
+        num_spec,
+        softcap,
+        num_valid,
+        id_base,
+        use_fp64,
+    )
     packed = pick_pack(part_v, part_i, rank, world)
     if world > 1:
         packed = all_reduce(packed)

@@ -1255,9 +1255,13 @@ k_dfly2_gla_ctx_attn(
   uint4 cr[8];
   auto ld_qk_half = [&](const uint8_t* base, int t_idx) {
     const int tok0 = t_idx * TILE;
-    if (page_shift >= 5 && tok0 + 31 < seqlen_k) {
-      const int64_t pg = get_pg(tok0 >> page_shift);
-      const int sl = (tok0 & pmask) + ktok;
+    if (page_shift >= 4 && tok0 + 31 < seqlen_k) {
+      const int pi0 = tok0 >> page_shift;
+      const int s0 = tok0 & pmask;
+      const int pi1 = (tok0 + 16) >> page_shift;
+      const int s1 = (tok0 + 16) & pmask;
+      const int64_t pg = (ktok < 16) ? get_pg(pi0) : get_pg(pi1);
+      const int sl = (ktok < 16) ? (s0 + ktok) : (s1 + ktok - 16);
       const uint8_t* p = base + pg * sb + (int64_t)sl * st;
 #pragma unroll
       for (int i = 0; i < 8; i++) cr[i] = ldg16(p + 16 * i);
@@ -1278,12 +1282,19 @@ k_dfly2_gla_ctx_attn(
   };
   auto ld_pv_half = [&](const uint8_t* base, int t_idx) {
     const int tok0 = t_idx * TILE;
-    if (page_shift >= 5 && tok0 + 31 < seqlen_k) {
-      const int64_t pg = get_pg(tok0 >> page_shift);
-      const int s0 = (tok0 & pmask) + l3;
-      const uint8_t* p = base + pg * sb + (int64_t)s0 * st + vdim;
+    if (page_shift >= 4 && tok0 + 31 < seqlen_k) {
+      const int pi0 = tok0 >> page_shift;
+      const int s0 = tok0 & pmask;
+      const int pi1 = (tok0 + 16) >> page_shift;
+      const int s1 = (tok0 + 16) & pmask;
+      const int64_t pg0 = get_pg(pi0);
+      const int64_t pg1 = (pi1 == pi0) ? pg0 : get_pg(pi1);
+      const uint8_t* p0 = base + pg0 * sb + (int64_t)(s0 + l3) * st + vdim;
+      const uint8_t* p1 = base + pg1 * sb + (int64_t)(s1 + l3) * st + vdim;
 #pragma unroll
-      for (int i = 0; i < 8; i++) cr[i] = ldg16(p + (int64_t)(4 * i) * st);
+      for (int i = 0; i < 4; i++) cr[i] = ldg16(p0 + (int64_t)(4 * i) * st);
+#pragma unroll
+      for (int i = 0; i < 4; i++) cr[4 + i] = ldg16(p1 + (int64_t)(4 * i) * st);
     } else {
 #pragma unroll
       for (int i = 0; i < 8; i++) {
@@ -1661,9 +1672,10 @@ k_stage_b_merge_gate_sink(
     const __half* __restrict__ rel_all,        // [B*8, 6, 1024]
     const __half* __restrict__ intra_rel_bias, // [6, 31]
     const __half* __restrict__ qrgkv,          // [B*8, qrgkv_stride] (gate at +864)
-    const __half* __restrict__ sinks,          // [B*8, 6]
+    const __half* __restrict__ sinks,          // [B*8, sinks_stride] (6 cols)
     __half* __restrict__ attn_out,             // [B*8, 768]
     int qrgkv_stride,
+    int sinks_stride,
     float scale) {
   const int b = blockIdx.x;
   const int h = blockIdx.y;
@@ -1740,7 +1752,7 @@ k_stage_b_merge_gate_sink(
       w_blk = expf(lse_blk - lse_tot);
     }
 
-    const float sink_v = __half2float(sinks[(size_t)tok * HQ_L + h]);
+    const float sink_v = __half2float(sinks[(size_t)tok * sinks_stride + h]);
     const float ss = sigmoid_f32(lse_tot - sink_v);
     const __half* cp = ao_ctx + ((size_t)tok * HQ_L + h) * HD + d0;
     const __half* gp = qrgkv + (size_t)tok * qrgkv_stride + 864 + h * HD + d0;
@@ -1838,6 +1850,7 @@ k_stage_c_qkrv_silu(
     __half* __restrict__ blk_k_c,         // [B, 8, 2, 128]
     __half* __restrict__ blk_v_c,         // [B, 8, 2, 128]
     int mega_stride,
+    int mid_stride,
     int slot,
     float eps) {
   const int b = blockIdx.x;
@@ -1847,7 +1860,7 @@ k_stage_c_qkrv_silu(
   const __half* row = mega_c + (size_t)b * mega_stride;
 
   // All 256 threads compute SwiGLU for 576 elements first!
-  __half* mp = mid_c + (size_t)b * 576;
+  __half* mp = mid_c + (size_t)b * mid_stride;
   for (int i = tid; i < 576; i += 256) {
     const float g = __half2float(row[i]);
     const float u = __half2float(row[576 + i]);
@@ -1925,7 +1938,9 @@ k_stage_c_combine(
     const __half* __restrict__ block_gate_bias, // [6, 16]
     const __half* __restrict__ block_rel_bias,  // [6, 16]
     const __half* __restrict__ block_sink,      // [6]
-    __half* __restrict__ attn_out_c,            // [B, 768]
+    __half* __restrict__ attn_out_c,            // [B, out_stride] (768 cols)
+    int gate_stride,
+    int out_stride,
     int slot,
     float scale) {
   const int b = blockIdx.x;
@@ -1963,10 +1978,10 @@ k_stage_c_combine(
     for (int u = 0; u < 4; u++) read[u] = fmaf(p, __half2float(vp[u]), read[u]);
   }
 
-  const float g = tanhf(__half2float(gate_raw[(size_t)b * HQ_L + h]) +
+  const float g = tanhf(__half2float(gate_raw[(size_t)b * gate_stride + h]) +
                         __half2float(block_gate_bias[h * MAX_BLK_SLOTS + slot]));
   const __half* cp = o_ctx_c + ((size_t)b * HQ_L + h) * HD + d0;
-  __half* dst = attn_out_c + (size_t)b * (HQ_L * HD) + h * HD + d0;
+  __half* dst = attn_out_c + (size_t)b * out_stride + h * HD + d0;
 #pragma unroll
   for (int u = 0; u < 4; u++) {
     dst[u] = __float2half_rn(__half2float(cp[u]) + read[u] * g);
@@ -1986,6 +2001,311 @@ k_add_slot_residual(
   __half* dst = h_corr + (size_t)b * H_DIM;
   for (int i = tid; i < H_DIM; i += 256) {
     dst[i] = __float2half_rn(__half2float(hp[i]) + __half2float(dp[i]));
+  }
+}
+
+// ============================================================================
+// 9. Single-Pass Volta (sm_70) W4 (INT4-g32 Symmetric) Draft-Only LM Head
+// ============================================================================
+// Weight layout:
+//   packed: [N, K/256, 32] uint32 (each lane owns 8 contiguous weights in the SAME group of 32!)
+//           bits [3:0]=u0, [7:4]=u2, [11:8]=u4, [15:12]=u6,
+//           bits [19:16]=u1, [23:20]=u3, [27:24]=u5, [31:28]=u7  (u = q + 8 in [0..15])
+//   scales: [N, K/32] fp16 (group = it * 8 + (lane >> 2))
+__device__ __forceinline__ __half2 u32_as_h2(unsigned u) {
+  union { unsigned u; __half2 h; } cvt;
+  cvt.u = u;
+  return cvt.h;
+}
+
+__device__ __forceinline__ unsigned ldg_u32_na(const uint32_t* p) {
+  unsigned v;
+  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+
+template <int M_TILE>
+__global__ void __launch_bounds__(256)
+k_w4_lm_head(
+    const __half* __restrict__ x,          // [M_total, H_DIM]
+    const uint32_t* __restrict__ packed,   // [N, 9, 32]
+    const __half* __restrict__ scales,     // [N, 72]
+    float* __restrict__ out,               // [M_total, N]
+    int m0,
+    int m_act,
+    int N) {
+  __shared__ __half s_x[M_TILE][H_DIM];
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  // Cooperatively stage [m_act, 2304] FP16 into shared memory (uint4 coalesced)
+  for (int m = 0; m < m_act; m++) {
+    const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)(m0 + m) * H_DIM);
+    uint4* dst = reinterpret_cast<uint4*>(s_x[m]);
+    for (int i = tid; i < H_DIM / 8; i += 256) {
+      dst[i] = src[i];
+    }
+  }
+  __syncthreads();
+
+  const int n = blockIdx.x * 8 + warp;
+  if (n >= N) return;
+
+  const uint32_t* wp = packed + (size_t)n * (9 * 32) + lane;
+  const __half* sp = scales + (size_t)n * 72;
+  const __half2 c1032 = __floats2half2_rn(1032.f, 1032.f);
+
+  float acc[M_TILE];
+#pragma unroll
+  for (int m = 0; m < M_TILE; m++) acc[m] = 0.f;
+
+  unsigned q_cur = ldg_u32_na(wp);
+  __half sc_cur = __ldg(sp + (lane >> 2));
+
+#pragma unroll
+  for (int it = 0; it < 9; it++) {
+    unsigned q_nxt = 0u;
+    __half sc_nxt = sc_cur;
+    if (it + 1 < 9) {
+      q_nxt = ldg_u32_na(wp + (it + 1) * 32);
+      sc_nxt = __ldg(sp + (it + 1) * 8 + (lane >> 2));
+    }
+    const unsigned q = q_cur;
+    const float sc = __half2float(sc_cur);
+    const __half2 w0 = __hsub2(u32_as_h2((q & 0x000F000Fu) | 0x64006400u), c1032);
+    const __half2 w1 = __hsub2(u32_as_h2(((q >> 4) & 0x000F000Fu) | 0x64006400u), c1032);
+    const __half2 w2 = __hsub2(u32_as_h2(((q >> 8) & 0x000F000Fu) | 0x64006400u), c1032);
+    const __half2 w3 = __hsub2(u32_as_h2(((q >> 12) & 0x000F000Fu) | 0x64006400u), c1032);
+    const int k_off = it * 256 + lane * 8;
+#pragma unroll
+    for (int m = 0; m < M_TILE; m++) {
+      if (m < m_act) {
+        const uint4 xv = *reinterpret_cast<const uint4*>(&s_x[m][k_off]);
+        __half2 p = __hmul2(w0, u32_as_h2(xv.x));
+        p = __hfma2(w1, u32_as_h2(xv.y), p);
+        p = __hfma2(w2, u32_as_h2(xv.z), p);
+        p = __hfma2(w3, u32_as_h2(xv.w), p);
+        const float2 pf = __half22float2(p);
+        acc[m] = fmaf(pf.x + pf.y, sc, acc[m]);
+      }
+    }
+    q_cur = q_nxt;
+    sc_cur = sc_nxt;
+  }
+
+#pragma unroll
+  for (int m = 0; m < M_TILE; m++) {
+    if (m < m_act) {
+      const float s = warp_sum(acc[m]);
+      if (lane == 0) out[(size_t)(m0 + m) * N + n] = s;
+    }
+  }
+}
+
+// ============================================================================
+// 10. Fused Single-AllReduce (val, tok, hc_embed_norm(embed_norm(E(tok)))) Exchange
+// ============================================================================
+constexpr int PACK_EMB_STRIDE = 8 + H_DIM;  // 2312 (multiple of 8 -> uint4 aligned at +8!)
+
+template <bool V_F64>
+__global__ void __launch_bounds__(256)
+k_pick_pack_with_embed(
+    const void* __restrict__ part_v,       // [B, n_parts] f32 or f64
+    const int32_t* __restrict__ part_i,    // [B, n_parts] int32 (global token IDs)
+    const __half* __restrict__ emb_w,      // [emb_rows, 2304] local vocab shard
+    const __half* __restrict__ emb_norm_w, // [2304] target embed_norm weight
+    const __half* __restrict__ hc_enorm_w, // [2304] Stage C hc_embed_norm weight
+    __half* __restrict__ packed_out,       // [world, B, 2312]
+    int n_parts,
+    int B,
+    int emb_rows,
+    int id_base,
+    int rank,
+    int world,
+    float eps) {
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  // 1. Reduce part_v[b, 0..n_parts-1] across 256 threads (supports arbitrary n_parts)
+  double best_v = -INFINITY;
+  int64_t best_t = 0;
+  for (int p = tid; p < n_parts; p += 256) {
+    const double v = V_F64
+        ? reinterpret_cast<const double*>(part_v)[(size_t)b * n_parts + p]
+        : (double)reinterpret_cast<const float*>(part_v)[(size_t)b * n_parts + p];
+    const int64_t t = (int64_t)part_i[(size_t)b * n_parts + p];
+    if (v > best_v || (v == best_v && (best_v == -INFINITY || t < best_t))) {
+      best_v = v;
+      best_t = t;
+    }
+  }
+  // Warp reduction
+#pragma unroll
+  for (int d = 16; d >= 1; d >>= 1) {
+    const double ov = __shfl_xor_sync(0xffffffffu, best_v, d);
+    const long long ot = __shfl_xor_sync(0xffffffffu, (long long)best_t, d);
+    if (ov > best_v || (ov == best_v && (int64_t)ot < best_t)) {
+      best_v = ov;
+      best_t = (int64_t)ot;
+    }
+  }
+  __shared__ double sm_v[8];
+  __shared__ int64_t sm_t[8];
+  if (lane == 0) {
+    sm_v[warp] = best_v;
+    sm_t[warp] = best_t;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    double v = (lane < 8) ? sm_v[lane] : -INFINITY;
+    int64_t t = (lane < 8) ? sm_t[lane] : 0;
+#pragma unroll
+    for (int d = 4; d >= 1; d >>= 1) {
+      const double ov = __shfl_xor_sync(0xffffffffu, v, d);
+      const long long ot = __shfl_xor_sync(0xffffffffu, (long long)t, d);
+      if (ov > v || (ov == v && (int64_t)ot < t)) {
+        v = ov;
+        t = (int64_t)ot;
+      }
+    }
+    if (lane == 0) {
+      sm_v[0] = v;
+      sm_t[0] = t;
+    }
+  }
+  __syncthreads();
+
+  const double win_v = sm_v[0];
+  const int64_t win_t = sm_t[0];
+  int local_t = (int)(win_t - (int64_t)id_base);
+  if (local_t < 0) local_t = 0;
+  if (local_t >= emb_rows) local_t = emb_rows - 1;
+
+  // 2. Local lookup + exact 2-stage norm: e_mid = half(rms(raw, emb_norm_w)), e_out = half(rms(e_mid, hc_enorm_w))
+  const __half* erow = emb_w + (size_t)local_t * H_DIM;
+  float raw[9];
+  float ss1 = 0.f;
+#pragma unroll
+  for (int k = 0; k < 9; k++) {
+    const int i = tid + k * 256;
+    const float v = __half2float(erow[i]);
+    raw[k] = v;
+    ss1 += v * v;
+  }
+  const float inv1 = rsqrtf(block_sum_256(ss1) * (1.0f / H_DIM) + eps);
+  float mid[9];
+  float ss2 = 0.f;
+#pragma unroll
+  for (int k = 0; k < 9; k++) {
+    const int i = tid + k * 256;
+    const float em = __half2float(__float2half_rn(raw[k] * inv1 * __half2float(emb_norm_w[i])));
+    mid[k] = em;
+    ss2 += em * em;
+  }
+  const float inv2 = rsqrtf(block_sum_256(ss2) * (1.0f / H_DIM) + eps);
+
+  // 3. Pack into [world, B, 2312] (rank slice has header + e_out; other rank slices zeroed)
+  const uint64_t vbits = (uint64_t)__double_as_longlong(win_v);
+  const uint64_t tbits = (uint64_t)win_t;
+  for (int r = 0; r < world; r++) {
+    __half* dst = packed_out + ((size_t)r * B + b) * PACK_EMB_STRIDE;
+    if (r == rank) {
+      if (tid == 0) {
+        dst[0] = __float2half_rn((float)(vbits & 0x7FFull));
+        dst[1] = __float2half_rn((float)((vbits >> 11) & 0x7FFull));
+        dst[2] = __float2half_rn((float)((vbits >> 22) & 0x7FFull));
+        dst[3] = __float2half_rn((float)((vbits >> 33) & 0x7FFull));
+        dst[4] = __float2half_rn((float)((vbits >> 44) & 0x7FFull));
+        dst[5] = __float2half_rn((float)(vbits >> 55));
+        dst[6] = __float2half_rn((float)(tbits & 0x7FFull));
+        dst[7] = __float2half_rn((float)(tbits >> 11));
+      }
+      __half* edst = dst + 8;
+#pragma unroll
+      for (int k = 0; k < 9; k++) {
+        const int i = tid + k * 256;
+        edst[i] = __float2half_rn(mid[k] * inv2 * __half2float(hc_enorm_w[i]));
+      }
+    } else {
+      if (tid < 8) dst[tid] = __float2half_rn(0.f);
+      __half* edst = dst + 8;
+#pragma unroll
+      for (int k = 0; k < 9; k++) {
+        edst[tid + k * 256] = __float2half_rn(0.f);
+      }
+    }
+  }
+}
+
+// Grid: (B, 2), Block: 256
+//   blockIdx.y == 0: unpack winning (tok, e_hc_normed) -> draft_tokens[b, step] & inp_c[b, 2304:4608]
+//   blockIdx.y == 1: compute rms_norm(h_bb[b*8 + next_slot], hc_hidden_norm) -> inp_c[b, 0:2304]
+__global__ void __launch_bounds__(256)
+k_unpack_tok_and_inp_c(
+    const __half* __restrict__ packed_in,     // [world, B, 2312]
+    const __half* __restrict__ h_bb,          // [B*8, 2304]
+    const __half* __restrict__ hc_hnorm_w,    // [2304]
+    int64_t* __restrict__ draft_tokens,       // [B, draft_stride]
+    __half* __restrict__ inp_c,               // [B, 4608]
+    int draft_stride,
+    int step,
+    int next_slot,
+    int B,
+    int world,
+    float eps) {
+  const int b = blockIdx.x;
+  const int which = blockIdx.y;
+  const int tid = threadIdx.x;
+
+  if (which == 0) {
+    __shared__ int s_best_r;
+    if (tid == 0) {
+      double best_v = -INFINITY;
+      int64_t best_t = 0;
+      int best_r = 0;
+      for (int r = 0; r < world; r++) {
+        const __half* p = packed_in + ((size_t)r * B + b) * PACK_EMB_STRIDE;
+        const uint64_t bits =
+            ((uint64_t)__half2int_rn(p[0]))
+            | ((uint64_t)__half2int_rn(p[1]) << 11)
+            | ((uint64_t)__half2int_rn(p[2]) << 22)
+            | ((uint64_t)__half2int_rn(p[3]) << 33)
+            | ((uint64_t)__half2int_rn(p[4]) << 44)
+            | ((uint64_t)__half2int_rn(p[5]) << 55);
+        const double v = __longlong_as_double((long long)bits);
+        const int64_t t = ((int64_t)__half2int_rn(p[6])) | ((int64_t)__half2int_rn(p[7]) << 11);
+        if (r == 0 || v > best_v) {
+          best_v = v;
+          best_t = t;
+          best_r = r;
+        }
+      }
+      draft_tokens[(size_t)b * draft_stride + step] = best_t;
+      s_best_r = best_r;
+    }
+    __syncthreads();
+    const int best_r = s_best_r;
+    const uint4* src = reinterpret_cast<const uint4*>(
+        packed_in + ((size_t)best_r * B + b) * PACK_EMB_STRIDE + 8);
+    uint4* dst = reinterpret_cast<uint4*>(inp_c + (size_t)b * (2 * H_DIM) + H_DIM);
+    for (int i = tid; i < H_DIM / 8; i += 256) {
+      dst[i] = src[i];
+    }
+  } else {
+    const __half* src = h_bb + (size_t)(b * BLK + next_slot) * H_DIM;
+    __half* dst = inp_c + (size_t)b * (2 * H_DIM);
+    float ss = 0.f;
+    for (int i = tid; i < H_DIM; i += 256) {
+      const float v = __half2float(src[i]);
+      ss += v * v;
+    }
+    const float inv = rsqrtf(block_sum_256(ss) * (1.0f / H_DIM) + eps);
+    for (int i = tid; i < H_DIM; i += 256) {
+      dst[i] = __float2half_rn(__half2float(src[i]) * inv * __half2float(hc_hnorm_w[i]));
+    }
   }
 }
 
@@ -2331,7 +2651,7 @@ void stage_b_merge_gate_sink(
       reinterpret_cast<const __half*>(qrgkv.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(sinks.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(attn_out.data_ptr<at::Half>()),
-      (int)qrgkv.stride(0), (float)scale);
+      (int)qrgkv.stride(0), (int)sinks.stride(0), (float)scale);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
@@ -2385,7 +2705,7 @@ void stage_c_qkrv_silu(
       reinterpret_cast<__half*>(r_c.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(blk_k_c.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(blk_v_c.data_ptr<at::Half>()),
-      (int)mega_c.stride(0), (int)slot, (float)eps);
+      (int)mega_c.stride(0), (int)mid_c.stride(0), (int)slot, (float)eps);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
@@ -2408,7 +2728,7 @@ void stage_c_combine(
       reinterpret_cast<const __half*>(block_rel_bias.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(block_sink.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(attn_out_c.data_ptr<at::Half>()),
-      (int)slot, (float)scale);
+      (int)gate_raw.stride(0), (int)attn_out_c.stride(0), (int)slot, (float)scale);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
@@ -2426,6 +2746,109 @@ void add_slot_residual(
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
+void w4_lm_head_forward(
+    torch::Tensor x, torch::Tensor packed, torch::Tensor scales, torch::Tensor out) {
+  const int M = (int)x.size(0);
+  const int N = (int)packed.size(0);
+  if (M <= 0 || N <= 0) return;
+  TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous() && x.size(1) == H_DIM);
+  TORCH_CHECK(packed.is_cuda() && packed.dtype() == torch::kInt32 && packed.is_contiguous()
+              && packed.dim() == 3 && packed.size(1) == 9 && packed.size(2) == 32);
+  TORCH_CHECK(scales.is_cuda() && scales.dtype() == torch::kHalf && scales.is_contiguous()
+              && scales.dim() == 2 && scales.size(0) == N && scales.size(1) == 72);
+  TORCH_CHECK(out.is_cuda() && out.dtype() == torch::kFloat && out.is_contiguous()
+              && out.size(0) == M && out.size(1) == N);
+  const at::cuda::CUDAGuard guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int grid = (N + 7) / 8;
+  const __half* xp = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
+  const uint32_t* pp = reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>());
+  const __half* sp = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>());
+  float* op = out.data_ptr<float>();
+  if (M == 1) {
+    k_w4_lm_head<1><<<grid, 256, 0, stream>>>(xp, pp, sp, op, 0, 1, N);
+  } else if (M == 2) {
+    k_w4_lm_head<2><<<grid, 256, 0, stream>>>(xp, pp, sp, op, 0, 2, N);
+  } else if (M == 3) {
+    k_w4_lm_head<3><<<grid, 256, 0, stream>>>(xp, pp, sp, op, 0, 3, N);
+  } else {
+    for (int m0 = 0; m0 < M; m0 += 4) {
+      const int ma = std::min(4, M - m0);
+      k_w4_lm_head<4><<<grid, 256, 0, stream>>>(xp, pp, sp, op, m0, ma, N);
+    }
+  }
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+void pick_pack_with_embed(
+    torch::Tensor part_v,
+    torch::Tensor part_i,
+    torch::Tensor emb_w,
+    torch::Tensor emb_norm_w,
+    torch::Tensor hc_enorm_w,
+    torch::Tensor packed_out,
+    int64_t id_base,
+    int64_t rank,
+    int64_t world,
+    double eps) {
+  const int B = (int)part_v.size(0);
+  const int n_parts = (int)part_v.size(1);
+  if (B <= 0) return;
+  TORCH_CHECK(part_v.is_contiguous() && part_i.is_contiguous() && part_i.dtype() == torch::kInt32);
+  TORCH_CHECK(emb_w.is_contiguous() && emb_w.dtype() == torch::kHalf && emb_w.size(1) == H_DIM);
+  TORCH_CHECK(packed_out.is_contiguous() && packed_out.dtype() == torch::kHalf
+              && packed_out.numel() == world * B * PACK_EMB_STRIDE);
+  const at::cuda::CUDAGuard guard(part_v.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int emb_rows = (int)emb_w.size(0);
+  if (part_v.dtype() == torch::kFloat64) {
+    k_pick_pack_with_embed<true><<<B, 256, 0, stream>>>(
+        part_v.data_ptr(), part_i.data_ptr<int32_t>(),
+        reinterpret_cast<const __half*>(emb_w.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(emb_norm_w.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(hc_enorm_w.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(packed_out.data_ptr<at::Half>()),
+        n_parts, B, emb_rows, (int)id_base, (int)rank, (int)world, (float)eps);
+  } else {
+    k_pick_pack_with_embed<false><<<B, 256, 0, stream>>>(
+        part_v.data_ptr(), part_i.data_ptr<int32_t>(),
+        reinterpret_cast<const __half*>(emb_w.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(emb_norm_w.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(hc_enorm_w.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(packed_out.data_ptr<at::Half>()),
+        n_parts, B, emb_rows, (int)id_base, (int)rank, (int)world, (float)eps);
+  }
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+void unpack_tok_and_inp_c(
+    torch::Tensor packed_in,
+    torch::Tensor h_bb,
+    torch::Tensor hc_hnorm_w,
+    torch::Tensor draft_tokens,
+    torch::Tensor inp_c,
+    int64_t step,
+    int64_t next_slot,
+    int64_t world,
+    double eps) {
+  const int B = (int)inp_c.size(0);
+  if (B <= 0) return;
+  TORCH_CHECK(packed_in.is_contiguous() && packed_in.dtype() == torch::kHalf
+              && packed_in.numel() == world * B * PACK_EMB_STRIDE);
+  TORCH_CHECK(draft_tokens.dtype() == torch::kInt64 && draft_tokens.stride(1) == 1);
+  const at::cuda::CUDAGuard guard(packed_in.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(B, 2);
+  k_unpack_tok_and_inp_c<<<grid, 256, 0, stream>>>(
+      reinterpret_cast<const __half*>(packed_in.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(h_bb.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(hc_hnorm_w.data_ptr<at::Half>()),
+      draft_tokens.data_ptr<int64_t>(),
+      reinterpret_cast<__half*>(inp_c.data_ptr<at::Half>()),
+      (int)draft_tokens.stride(0), (int)step, (int)next_slot, B, (int)world, (float)eps);
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("extract_inputs", &extract_inputs);
   m.def("stage_a_prep", &stage_a_prep);
@@ -2440,4 +2863,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("stage_c_qkrv_silu", &stage_c_qkrv_silu);
   m.def("stage_c_combine", &stage_c_combine);
   m.def("add_slot_residual", &add_slot_residual);
+  m.def("w4_lm_head_forward", &w4_lm_head_forward);
+  m.def("pick_pack_with_embed", &pick_pack_with_embed);
+  m.def("unpack_tok_and_inp_c", &unpack_tok_and_inp_c);
 }

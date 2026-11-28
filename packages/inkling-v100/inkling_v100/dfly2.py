@@ -47,11 +47,19 @@ from .ops.dfly2_ops_cuda import (
     plan_dfly2_splits,
     preallocate_dfly2_workspace,
 )
-from .ops.dspark_markov import shard_argmax, shard_sample_slot
+from .ops.dspark_markov import (
+    pick_pack,
+    shard_argmax,
+    shard_argmax_parts,
+    shard_sample_slot,
+    shard_sample_slot_parts,
+    unpack_tokens,
+)
 from .ops.dspark_sm70 import silu_and_mul
 from .ops.dspark_verify import greedy_verify_tokens, shard_rejection_sample
 from .ops.fp8_dense_cuda import (
     fp8_qpn8_linear,
+    get_fp8_safetensors,
     load_fp8_dense_ext,
     preallocate_fp8_dequant_ws,
     prepare_qpn8_weight,
@@ -132,7 +140,6 @@ class _DFly2BackboneLayer(nn.Module):
         is_local: bool,
         target_kv_layer: int,
         qrgkv_proj: _DFly2Linear,
-        sink_w_t: torch.Tensor,
         wo_ud: _DFly2Linear,
         gate_up_proj: _DFly2Linear,
         down_proj: _DFly2Linear,
@@ -151,7 +158,6 @@ class _DFly2BackboneLayer(nn.Module):
         self.wo_ud = wo_ud
         self.gate_up_proj = gate_up_proj
         self.down_proj = down_proj
-        self.register_buffer("sink_w_t", sink_w_t, persistent=False)
         self.register_buffer("input_ln", input_ln, persistent=False)
         self.register_buffer("post_ln", post_ln, persistent=False)
         self.register_buffer("q_scale", q_scale, persistent=False)
@@ -169,7 +175,8 @@ class Inkling2DFly2DraftModel(nn.Module):
         device: torch.device,
         tp_rank: int,
         tp_size: int,
-        use_fp8: bool = True,
+        use_fp8: bool = False,
+        stage_c_fp8: bool = True,
     ) -> None:
         super().__init__()
         assert tp_size == 4, f"Inkling2DFly2DraftModel requires TP4, got tp_size={tp_size}"
@@ -177,6 +184,7 @@ class Inkling2DFly2DraftModel(nn.Module):
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.use_fp8 = use_fp8
+        self.stage_c_fp8 = bool(stage_c_fp8 or use_fp8)
 
         p = Path(ckpt)
         st_path = (p / "model.safetensors") if p.is_dir() else p
@@ -189,7 +197,7 @@ class Inkling2DFly2DraftModel(nn.Module):
         self.soft_cap = float(cfg.get("final_logit_softcapping", 30.0))
         assert self.block_size == BLK, f"Expected block_size={BLK}, got {self.block_size}"
 
-        if use_fp8:
+        if use_fp8 or self.stage_c_fp8:
             load_fp8_dense_ext()
             preallocate_fp8_dequant_ws(device, 4608 * 2560)
 
@@ -210,7 +218,7 @@ class Inkling2DFly2DraftModel(nn.Module):
         eh_w = sd["mtp_fusion.eh_proj.weight"][:, r * 1152 : (r + 1) * 1152].contiguous()
         self.eh_proj = _DFly2Linear(eh_w, device, use_fp8)
 
-        # Stage B: 3 backbone layers
+        # Stage B: 3 backbone layers (sink_proj merged into qrgkv_proj -> [2150, 2304])
         layers = []
         for li in range(3):
             pfx = f"layers.{li}"
@@ -219,15 +227,10 @@ class Inkling2DFly2DraftModel(nn.Module):
             wg = sd[f"{pfx}.self_attn.gate_attn.weight"][r * 768 : (r + 1) * 768]
             wk = sd[f"{pfx}.self_attn.wk_dv.weight"][r * 256 : (r + 1) * 256]
             wv = sd[f"{pfx}.self_attn.wv_dv.weight"][r * 256 : (r + 1) * 256]
-            qrgkv_w = torch.cat([wq, wr, wg, wk, wv], dim=0).contiguous()  # [2144, 2304]
+            ws = sd[f"{pfx}.self_attn.attn_sink_proj.weight"][r * HQ_L : (r + 1) * HQ_L]
+            qrgkv_w = torch.cat([wq, wr, wg, wk, wv, ws], dim=0).contiguous()  # [2150, 2304]
             qrgkv_proj = _DFly2Linear(qrgkv_w, device, use_fp8)
 
-            sink_w_t = (
-                sd[f"{pfx}.self_attn.attn_sink_proj.weight"][r * HQ_L : (r + 1) * HQ_L]
-                .to(device=device, dtype=torch.float16)
-                .t()
-                .contiguous()
-            )
             wo_w = sd[f"{pfx}.self_attn.wo_ud.weight"][:, r * 768 : (r + 1) * 768].contiguous()
             wo_ud = _DFly2Linear(wo_w, device, use_fp8)
 
@@ -243,7 +246,6 @@ class Inkling2DFly2DraftModel(nn.Module):
                     is_local=(li in self.local_layer_ids),
                     target_kv_layer=self.target_kv_layers[li],
                     qrgkv_proj=qrgkv_proj,
-                    sink_w_t=sink_w_t,
                     wo_ud=wo_ud,
                     gate_up_proj=gate_up_proj,
                     down_proj=down_proj,
@@ -279,14 +281,6 @@ class Inkling2DFly2DraftModel(nn.Module):
             persistent=False,
         )
         self.register_buffer(
-            "hc_block_gate_w_t",
-            sd["hidden_correction.attention.block_gate.weight"][r * HQ_L : (r + 1) * HQ_L]
-            .to(device=device, dtype=torch.float16)
-            .t()
-            .contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
             "hc_block_gate_bias",
             _buf("hidden_correction.attention.block_gate_bias", slice(r * HQ_L, (r + 1) * HQ_L)),
             persistent=False,
@@ -308,31 +302,31 @@ class Inkling2DFly2DraftModel(nn.Module):
         hc_r = sd["hidden_correction.attention.r_in.weight"][r * 96 : (r + 1) * 96]
         hc_k = sd["hidden_correction.attention.k_blk_proj.weight"][r * 256 : (r + 1) * 256]
         hc_v = sd["hidden_correction.attention.v_blk_proj.weight"][r * 256 : (r + 1) * 256]
-        # [576 + 576 + 768 + 96 + 256 + 256 = 2528, 4608]
+        hc_bg = sd["hidden_correction.attention.block_gate.weight"][r * HQ_L : (r + 1) * HQ_L]
+        # Merged [576 + 576 + 768 + 96 + 256 + 256 + 6 = 2534, 4608]
         self.hc_mega_proj = _DFly2Linear(
-            torch.cat([hc_g, hc_u, hc_q, hc_r, hc_k, hc_v], dim=0).contiguous(), device, use_fp8
+            torch.cat([hc_g, hc_u, hc_q, hc_r, hc_k, hc_v, hc_bg], dim=0).contiguous(),
+            device,
+            self.stage_c_fp8,
         )
         self.hc_kv0_proj = _DFly2Linear(
-            torch.cat([hc_k, hc_v], dim=0).contiguous(), device, use_fp8
+            torch.cat([hc_k, hc_v], dim=0).contiguous(), device, self.stage_c_fp8
         )
-        self.hc_down_proj = _DFly2Linear(
-            sd["hidden_correction.down_proj.weight"][:, r * HC_I_LOCAL : (r + 1) * HC_I_LOCAL].contiguous(),
-            device,
-            use_fp8,
-        )
-        self.hc_o_proj = _DFly2Linear(
-            sd["hidden_correction.attention.o_proj.weight"][:, r * 768 : (r + 1) * 768].contiguous(),
-            device,
-            use_fp8,
+        # Merged [2304, 576 + 768 = 1344] replaces hc_down_proj + hc_o_proj + add_!
+        hc_down_w = sd["hidden_correction.down_proj.weight"][:, r * HC_I_LOCAL : (r + 1) * HC_I_LOCAL]
+        hc_o_w = sd["hidden_correction.attention.o_proj.weight"][:, r * 768 : (r + 1) * 768]
+        self.hc_out_proj = _DFly2Linear(
+            torch.cat([hc_down_w, hc_o_w], dim=1).contiguous(), device, self.stage_c_fp8
         )
 
         del sd
         if r == 0:
             nbytes = sum(b.numel() * b.element_size() for b in self.buffers() if b is not None)
             log.info(
-                "inkling_v100.dfly2: loaded %s (dtype=%s, kv_layers=%s, %.1f MB/GPU TP4, 0 B draft KV)",
+                "inkling_v100.dfly2: loaded %s (bb=%s, stage_c=%s, kv_layers=%s, %.1f MB/GPU TP4, 0 B draft KV)",
                 st_path.name,
                 "fp8_qpn8" if use_fp8 else "fp16",
+                "fp8_qpn8" if self.stage_c_fp8 else "fp16",
                 self.target_kv_layers,
                 nbytes / 1e6,
             )
@@ -375,6 +369,12 @@ class Inkling2DFly2Speculator(BaseSpeculator):
         self._last_k = self.num_speculative_steps
         self._ckpt_path = _resolve_ckpt_path(vllm_config)
         self._use_fp8 = os.environ.get("INKLING_DFLY2_DTYPE", "fp16").strip().lower() == "fp8"
+        self._stage_c_fp8 = (
+            os.environ.get("INKLING_DFLY2_STAGE_C_DTYPE", "fp8").strip().lower() == "fp8"
+            or self._use_fp8
+        )
+        self._lm_head_mode = os.environ.get("INKLING_DFLY2_LM_HEAD_DTYPE", "w4").strip().lower()
+        self._fuse_emb_ar = os.environ.get("INKLING_DFLY2_FUSE_EMB_AR", "1").strip() != "0"
         self._use_graphs = os.environ.get("INKLING_DFLY2_GRAPH", "1").strip() != "0"
         self._shard_verify = os.environ.get("INKLING_DFLY2_SHARD_VERIFY", "1").strip() != "0"
 
@@ -391,6 +391,16 @@ class Inkling2DFly2Speculator(BaseSpeculator):
         self.tp_size = 4
         self._sampler: Any = None
         self._head_info: tuple[Any, float | None, int, int, int, int] | None = None
+        # Draft-only quantized lm_head (100% lossless on target verification!)
+        self._lm_w4_packed: torch.Tensor | None = None
+        self._lm_w4_scales: torch.Tensor | None = None
+        self._lm_fp8_codes: torch.Tensor | None = None
+        self._lm_fp8_s16: torch.Tensor | None = None
+        self._lm_fp8_s32: torch.Tensor | None = None
+        self._lm_fp8_n_out: int = 0
+        self._can_fuse_emb_ar: bool = False
+        self._emb_w: torch.Tensor | None = None
+        self._emb_norm_w: torch.Tensor | None = None
 
         # Sampling & verification buffers
         self.draft_tokens = torch.zeros(
@@ -471,13 +481,20 @@ class Inkling2DFly2Speculator(BaseSpeculator):
 
         load_dfly2_ops_ext()
         self.model = Inkling2DFly2DraftModel(
-            self._ckpt_path, self.device, self.tp_rank, self.tp_size, use_fp8=self._use_fp8
+            self._ckpt_path,
+            self.device,
+            self.tp_rank,
+            self.tp_size,
+            use_fp8=self._use_fp8,
+            stage_c_fp8=self._stage_c_fp8,
         )
 
         decoder_layers = self.target_lm.model.layers
         self.target_attn_mods = [decoder_layers[li].attn for li in self.model.target_kv_layers]
         self._head_info = self._target_head_info(target_model)
         assert self._head_info is not None, "Inkling2DFly2Speculator requires standard ParallelLMHead"
+        self._init_draft_lm_head()
+        self._init_fused_embed_ar()
 
         if self._probabilistic:
             lm_head = self._head_info[0]
@@ -501,11 +518,153 @@ class Inkling2DFly2Speculator(BaseSpeculator):
 
         self._alloc_scratch_buffers()
 
+    @torch.no_grad()
+    def _init_draft_lm_head(self) -> None:
+        """Build draft-only W4 (INT4-g32) or FP8 QPN8 lm_head shard (target verify stays exact!)."""
+        assert self._head_info is not None
+        lm_head = self._head_info[0]
+        target_fp8 = bool(getattr(lm_head, "_fp8_ready", False))
+        mode = self._lm_head_mode
+        if mode in ("target", "exact", "fp16", "off", "0"):
+            return
+
+        dev = self.device
+        if mode == "fp8":
+            if target_fp8:
+                # Target already uses QPN8 FP8 lm_head -> zero extra VRAM!
+                return
+            load_fp8_dense_ext()
+            w = lm_head.weight
+            n_out = int(w.shape[0])
+            w8 = torch.empty((n_out, H_DIM), dtype=torch.float8_e4m3fn, device=dev)
+            s32 = torch.empty((n_out,), dtype=torch.float32, device=dev)
+            for s0 in range(0, n_out, 4096):
+                s1 = min(s0 + 4096, n_out)
+                wf = w[s0:s1].float()
+                sc = (wf.abs().amax(dim=1) / 448.0).clamp_min(1e-12)
+                w8[s0:s1] = (wf / sc[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                s32[s0:s1] = sc
+            codes, s16, s32_pad, _, n_out = prepare_qpn8_weight(w8, s32, pad_align=128)
+            del w8, s32
+            self._lm_fp8_codes = codes
+            self._lm_fp8_s16 = s16
+            self._lm_fp8_s32 = s32_pad
+            self._lm_fp8_n_out = n_out
+            if self.tp_rank == 0:
+                log.info(
+                    "inkling_v100.dfly2: draft-only FP8 QPN8 lm_head active (%.1f MB/GPU, exact target verify).",
+                    (codes.numel() + s16.numel() * 2 + s32_pad.numel() * 4) / 1e6,
+                )
+            return
+
+        if mode == "w4":
+            n_out = int(lm_head._fp8_n_out) if target_fp8 else int(lm_head.weight.shape[0])
+            packed = torch.empty((n_out, 9, 32), dtype=torch.int32, device=dev)
+            scales = torch.empty((n_out, 72), dtype=torch.float16, device=dev)
+            sf = get_fp8_safetensors() if target_fp8 else None
+            w_cpu_fp8 = None
+            s_cpu_fp8 = None
+            w_full_dq = None
+            if target_fp8:
+                if sf is not None:
+                    w_full = sf.get_tensor("model.llm.unembed.weight")
+                    s_full = sf.get_tensor("model.llm.unembed.weight_scale")
+                    w_cpu_fp8 = w_full[self.tp_rank * n_out : (self.tp_rank + 1) * n_out]
+                    s_cpu_fp8 = s_full[self.tp_rank * n_out : (self.tp_rank + 1) * n_out]
+                else:
+                    from vllm import _sm70_ops as sm70_ops
+
+                    n_pad = int(lm_head._fp8_s16.numel())
+                    w_kn = torch.empty((H_DIM, n_pad), dtype=torch.float16, device=dev)
+                    sm70_ops.fp8_qpn8_dequantize_sm70_out(
+                        w_kn, lm_head._fp8_codes, lm_head._fp8_s16.view(1, -1)
+                    )
+                    w_full_dq = w_kn[:, :n_out].t().contiguous()
+                    del w_kn
+
+            for s0 in range(0, n_out, 4096):
+                s1 = min(s0 + 4096, n_out)
+                if not target_fp8:
+                    wf = lm_head.weight[s0:s1].float()
+                elif w_cpu_fp8 is not None and s_cpu_fp8 is not None:
+                    wf = w_cpu_fp8[s0:s1].to(dev).float() * s_cpu_fp8[s0:s1].to(dev).float()[:, None]
+                else:
+                    assert w_full_dq is not None
+                    wf = w_full_dq[s0:s1].float()
+                g = wf.view(s1 - s0, 72, 32)
+                sc = (g.abs().amax(dim=-1) / 7.0).clamp_min(1e-12)
+                sc_h = sc.half()
+                u = ((g / sc_h.float().unsqueeze(-1)).round().clamp(-8, 7) + 8).to(torch.int64)
+                u = u.view(s1 - s0, 9, 32, 8)
+                q = (
+                    u[..., 0]
+                    | (u[..., 2] << 4)
+                    | (u[..., 4] << 8)
+                    | (u[..., 6] << 12)
+                    | (u[..., 1] << 16)
+                    | (u[..., 3] << 20)
+                    | (u[..., 5] << 24)
+                    | (u[..., 7] << 28)
+                ).to(torch.int32)
+                packed[s0:s1].copy_(q)
+                scales[s0:s1].copy_(sc_h)
+            del w_cpu_fp8, s_cpu_fp8, w_full_dq
+            self._lm_w4_packed = packed
+            self._lm_w4_scales = scales
+            if self.tp_rank == 0:
+                log.info(
+                    "inkling_v100.dfly2: draft-only W4 (INT4-g32) lm_head active (%.1f MB/GPU, exact target verify).",
+                    (packed.numel() * 4 + scales.numel() * 2) / 1e6,
+                )
+
+    def _init_fused_embed_ar(self) -> None:
+        """Enable single-AR fused (val, tok, hc_embed_norm(embed_norm(E(tok)))) in Stage C."""
+        self._can_fuse_emb_ar = False
+        if not self._fuse_emb_ar or self._head_info is None or self.target_lm is None:
+            return
+        lm_head, _, _, id_base, _, _ = self._head_info
+        lm_shard = (
+            int(lm_head._fp8_n_out)
+            if getattr(lm_head, "_fp8_ready", False)
+            else int(lm_head.weight.shape[0])
+        )
+        emb_mod = getattr(self.target_lm.model, "embed_tokens", None)
+        enorm_mod = getattr(self.target_lm.model, "embed_norm", None)
+        if emb_mod is None or enorm_mod is None:
+            return
+        emb_w = getattr(emb_mod, "weight", None)
+        enorm_w = getattr(enorm_mod, "weight", None)
+        if (
+            emb_w is None
+            or enorm_w is None
+            or emb_w.dtype != torch.float16
+            or enorm_w.dtype != torch.float16
+            or emb_w.dim() != 2
+            or emb_w.shape[0] != lm_shard
+            or emb_w.shape[1] != H_DIM
+            or not emb_w.is_contiguous()
+            or enorm_w.numel() != H_DIM
+            or int(getattr(emb_mod, "vocab_start_index", id_base)) != id_base
+        ):
+            return
+        self._emb_w = emb_w
+        self._emb_norm_w = enorm_w.view(-1).contiguous()
+        self._can_fuse_emb_ar = True
+        if self.tp_rank == 0:
+            log.info("inkling_v100.dfly2: fused single-AR Stage C (tok + embed_norm + hc_embed_norm) active.")
+
     def _alloc_scratch_buffers(self) -> None:
         dev = self.device
         B = self.max_num_reqs
         N8 = B * BLK
         has_gla = any(bool(getattr(m, "use_gla", False)) for m in self.target_attn_mods)
+        assert self._head_info is not None
+        lm_head = self._head_info[0]
+        lm_shard = (
+            int(lm_head._fp8_n_out)
+            if getattr(lm_head, "_fp8_ready", False)
+            else int(lm_head.weight.shape[0])
+        )
 
         bufs = {
             # Input extraction
@@ -516,12 +675,10 @@ class Inkling2DFly2Speculator(BaseSpeculator):
             "req_slots": torch.zeros(B, dtype=torch.int32, device=dev),
             # Stage A
             "eh_in_local": torch.empty(B, H_DIM // 2, dtype=torch.float16, device=dev),
-            "eh_out": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
-            # Stage B
+            # Stage B (qrgkv_b has merged 6 sink cols at 2144..2150!)
             "res_f32": torch.empty(N8, H_DIM, dtype=torch.float32, device=dev),
             "x_norm": torch.empty(N8, H_DIM, dtype=torch.float16, device=dev),
-            "qrgkv_b": torch.empty(N8, 2144, dtype=torch.float16, device=dev),
-            "sinks_b": torch.empty(N8, HQ_L, dtype=torch.float16, device=dev),
+            "qrgkv_b": torch.empty(N8, 2150, dtype=torch.float16, device=dev),
             "q_b": torch.empty(N8, HQ_L, HD, dtype=torch.float16, device=dev),
             "r_b": torch.empty(N8, HQ_L, D_REL, dtype=torch.float16, device=dev),
             "rel_all_b": torch.empty(N8, HQ_L, E_REL, dtype=torch.float16, device=dev),
@@ -530,25 +687,20 @@ class Inkling2DFly2Speculator(BaseSpeculator):
             "ao_ctx_b": torch.empty(N8, HQ_L, HD, dtype=torch.float16, device=dev),
             "lse_ctx_b": torch.empty(N8, HQ_L, dtype=torch.float32, device=dev),
             "attn_out_b": torch.empty(N8, HQ_L * HD, dtype=torch.float16, device=dev),
-            "o_part_b": torch.empty(N8, H_DIM, dtype=torch.float16, device=dev),
             "gu_b": torch.empty(N8, 2 * I_LOCAL, dtype=torch.float16, device=dev),
-            "mlp_part_b": torch.empty(N8, H_DIM, dtype=torch.float16, device=dev),
-            # Stage C
+            # Stage C (mega_c has merged 6 block_gate cols at 2528..2534; hc_out_in_c packs [mid_c(576) | attn_out_c(768)])
             "inp_c": torch.empty(B, 2 * H_DIM, dtype=torch.float16, device=dev),
             "kv0_c": torch.empty(B, 512, dtype=torch.float16, device=dev),
-            "mega_c": torch.empty(B, 2528, dtype=torch.float16, device=dev),
-            "gate_raw_c": torch.empty(B, HQ_L, dtype=torch.float16, device=dev),
-            "mid_c": torch.empty(B, HC_I_LOCAL, dtype=torch.float16, device=dev),
+            "mega_c": torch.empty(B, 2534, dtype=torch.float16, device=dev),
+            "hc_out_in_c": torch.empty(B, HC_I_LOCAL + HQ_L * HD, dtype=torch.float16, device=dev),
             "q_c": torch.empty(B, HQ_L, HD, dtype=torch.float16, device=dev),
             "r_c": torch.empty(B, HQ_L, D_REL, dtype=torch.float16, device=dev),
             "rel_all_c": torch.empty(B, HQ_L, E_REL, dtype=torch.float16, device=dev),
             "blk_k_c": torch.empty(B, BLK, HKV_L, HD, dtype=torch.float16, device=dev),
             "blk_v_c": torch.empty(B, BLK, HKV_L, HD, dtype=torch.float16, device=dev),
             "o_ctx_c": torch.empty(B, HQ_L, HD, dtype=torch.float16, device=dev),
-            "attn_out_c": torch.empty(B, HQ_L * HD, dtype=torch.float16, device=dev),
-            "delta_mlp_c": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
-            "delta_attn_c": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
             "h_corr_c": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
+            "logits_c": torch.empty(B, lm_shard, dtype=torch.float32, device=dev),
         }
         if has_gla:
             bufs["q_pack_b"] = torch.empty(2 * N8 * 3 * HD, dtype=torch.float16, device=dev)
@@ -603,7 +755,7 @@ class Inkling2DFly2Speculator(BaseSpeculator):
             head_dim=256 if has_gla else HD,
             device=self.device,
         )
-        if self._use_fp8:
+        if self._use_fp8 or self._stage_c_fp8:
             preallocate_fp8_dequant_ws(self.device, 4608 * 2560)
         self._kv_ready = True
 
@@ -695,12 +847,37 @@ class Inkling2DFly2Speculator(BaseSpeculator):
             splits,
         )
 
-    def _sample_slot(self, h_corr: torch.Tensor, B: int, step: int) -> torch.Tensor:
+    def _draft_local_logits(self, h_corr: torch.Tensor, B: int) -> torch.Tensor:
         assert self._head_info is not None
-        lm_head, softcap, num_valid, id_base, rank, world = self._head_info
-        local_logits = self._target_local_logits(lm_head, h_corr)
+        lm_head = self._head_info[0]
+        target_fp8 = bool(getattr(lm_head, "_fp8_ready", False))
+        # W4 INT4-g32 wins at small B (M=1..3: 82.5/95.8/116.0 us vs FP8 135.6 us; M=1..8 vs FP16 403-505 us)
+        if self._lm_w4_packed is not None and self._lm_w4_scales is not None:
+            if B <= 3 or (not target_fp8 and B <= 8):
+                out = self._bufs["logits_c"][:B]
+                load_dfly2_ops_ext().w4_lm_head_forward(
+                    h_corr, self._lm_w4_packed, self._lm_w4_scales, out
+                )
+                return out
+        if self._lm_fp8_codes is not None and self._lm_fp8_s16 is not None and self._lm_fp8_s32 is not None:
+            return fp8_qpn8_linear(
+                h_corr,
+                self._lm_fp8_codes,
+                self._lm_fp8_s16,
+                self._lm_fp8_s32,
+                self._lm_fp8_n_out,
+                out_dtype=torch.float32,
+                is_lm_head=True,
+            )
+        return self._target_local_logits(lm_head, h_corr)
+
+    def _sample_slot_parts(
+        self, local_logits: torch.Tensor, B: int, step: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._head_info is not None
+        _, softcap, num_valid, id_base, _, _ = self._head_info
         if self._probabilistic:
-            return shard_sample_slot(
+            return shard_sample_slot_parts(
                 local_logits,
                 self._bufs["req_slots"][:B],
                 self._bufs["anchor_pos"][:B],
@@ -712,27 +889,27 @@ class Inkling2DFly2Speculator(BaseSpeculator):
                 softcap,
                 num_valid,
                 id_base,
-                rank,
-                world,
                 self.use_fp64_gumbel,
-                tensor_model_parallel_all_reduce,
             )
-        return shard_argmax(
-            local_logits,
-            softcap,
-            num_valid,
-            id_base,
-            rank,
-            world,
-            tensor_model_parallel_all_reduce,
-        )
+        return shard_argmax_parts(local_logits, softcap, num_valid, id_base)
+
+    def _sample_slot(self, h_corr: torch.Tensor, B: int, step: int) -> torch.Tensor:
+        assert self._head_info is not None
+        _, _, _, _, rank, world = self._head_info
+        local_logits = self._draft_local_logits(h_corr, B)
+        part_v, part_i = self._sample_slot_parts(local_logits, B, step)
+        packed = pick_pack(part_v, part_i, rank, world)
+        if world > 1:
+            packed = tensor_model_parallel_all_reduce(packed)
+        return unpack_tokens(packed)
 
     def _run_dfly2_core(self, B: int, K_active: int, skip_attn: bool = False) -> None:
         ext = load_dfly2_ops_ext()
         m = self.model
-        assert m is not None and self.target_lm is not None
+        assert m is not None and self.target_lm is not None and self._head_info is not None
         bufs = self._bufs
         N8 = B * BLK
+        _, _, _, id_base, rank, world = self._head_info
 
         anchor_tok = bufs["anchor_tok"][:B]
         anchor_pos = bufs["anchor_pos"][:B]
@@ -741,7 +918,8 @@ class Inkling2DFly2Speculator(BaseSpeculator):
         # ---- Stage A: normalized anchor embed + MTPFusion + block init + L0 input_layernorm ----
         e0 = self.target_lm.model.embed_input_ids(anchor_tok).to(torch.float16).contiguous()
         eh_in = bufs["eh_in_local"][:B]
-        eh_out = bufs["eh_out"][:B]
+        # Allocate AllReduce inputs inside graph capture so CustomAllReduce uses zero-copy IPC!
+        eh_out = torch.empty((B, H_DIM), dtype=torch.float16, device=self.device)
         ext.stage_a_prep(e0, prev_hidden, m.mtp_enorm, m.mtp_hnorm, eh_in, self.tp_rank, EPS)
         m.eh_proj.forward_into(eh_in, eh_out)
         eh_red = tensor_model_parallel_all_reduce(eh_out)
@@ -754,7 +932,7 @@ class Inkling2DFly2Speculator(BaseSpeculator):
 
         # ---- Stage B: 3 parallel backbone layers reading target [L20, L23, L22] KV ----
         qrgkv_b = bufs["qrgkv_b"][:N8]
-        sinks_b = bufs["sinks_b"][:N8]
+        sinks_b = qrgkv_b[:, 2144:2150]
         q_b = bufs["q_b"][:N8]
         r_b = bufs["r_b"][:N8]
         rel_all_b = bufs["rel_all_b"][:N8]
@@ -763,14 +941,11 @@ class Inkling2DFly2Speculator(BaseSpeculator):
         ao_ctx_b = bufs["ao_ctx_b"][:N8]
         lse_ctx_b = bufs["lse_ctx_b"][:N8]
         attn_out_b = bufs["attn_out_b"][:N8]
-        o_part_b = bufs["o_part_b"][:N8]
         gu_b = bufs["gu_b"][:N8]
-        mlp_part_b = bufs["mlp_part_b"][:N8]
 
         for li in range(3):
             layer = m.layers[li]
             layer.qrgkv_proj.forward_into(x_norm, qrgkv_b)
-            torch.mm(x_norm, layer.sink_w_t, out=sinks_b)
             ext.stage_b_qkrv_prep(
                 qrgkv_b,
                 anchor_pos,
@@ -800,12 +975,14 @@ class Inkling2DFly2Speculator(BaseSpeculator):
                 attn_out_b,
                 SCALE,
             )
+            o_part_b = torch.empty((N8, H_DIM), dtype=torch.float16, device=self.device)
             layer.wo_ud.forward_into(attn_out_b, o_part_b)
             o_red = tensor_model_parallel_all_reduce(o_part_b)
             ext.rmsnorm_res(o_red, res_f32, layer.post_ln, x_norm, EPS)
 
             layer.gate_up_proj.forward_into(x_norm, gu_b)
             mid_b = silu_and_mul(gu_b)
+            mlp_part_b = torch.empty((N8, H_DIM), dtype=torch.float16, device=self.device)
             layer.down_proj.forward_into(mid_b, mlp_part_b)
             mlp_red = tensor_model_parallel_all_reduce(mlp_part_b)
             next_ln = m.layers[li + 1].input_ln if li < 2 else m.final_norm
@@ -825,22 +1002,22 @@ class Inkling2DFly2Speculator(BaseSpeculator):
 
         # ---- Stage C: Sequential AttentiveCorrection slots 1..K_active (L22 SWA-1024!) ----
         mega_c = bufs["mega_c"][:B]
-        gate_raw_c = bufs["gate_raw_c"][:B]
-        mid_c = bufs["mid_c"][:B]
+        gate_raw_c = mega_c[:, 2528:2534]
+        hc_out_in_c = bufs["hc_out_in_c"][:B]
+        mid_c = hc_out_in_c[:, :HC_I_LOCAL]
+        attn_out_c = hc_out_in_c[:, HC_I_LOCAL:]
         q_c = bufs["q_c"][:B]
         r_c = bufs["r_c"][:B]
         rel_all_c = bufs["rel_all_c"][:B]
         o_ctx_c = bufs["o_ctx_c"][:B]
-        attn_out_c = bufs["attn_out_c"][:B]
-        delta_mlp_c = bufs["delta_mlp_c"][:B]
-        delta_attn_c = bufs["delta_attn_c"][:B]
         h_corr_c = bufs["h_corr_c"][:B]
 
-        e_prev = e0
+        # Prepare slot 1 input once before the loop
+        ext.stage_c_prep(h_bb, e0, m.hc_hidden_norm, m.hc_embed_norm, inp_c, 1, EPS)
+        use_fused_emb = bool(self._can_fuse_emb_ar and world > 1 and B <= 8)
+
         for slot in range(1, K_active + 1):
-            ext.stage_c_prep(h_bb, e_prev, m.hc_hidden_norm, m.hc_embed_norm, inp_c, slot, EPS)
             m.hc_mega_proj.forward_into(inp_c, mega_c)
-            torch.mm(inp_c, m.hc_block_gate_w_t, out=gate_raw_c)
             ext.stage_c_qkrv_silu(
                 mega_c,
                 m.hc_q_scale,
@@ -870,16 +1047,48 @@ class Inkling2DFly2Speculator(BaseSpeculator):
                 slot,
                 SCALE,
             )
-            m.hc_down_proj.forward_into(mid_c, delta_mlp_c)
-            m.hc_o_proj.forward_into(attn_out_c, delta_attn_c)
-            delta_mlp_c.add_(delta_attn_c)
-            delta_red = tensor_model_parallel_all_reduce(delta_mlp_c)
+            delta_c = torch.empty((B, H_DIM), dtype=torch.float16, device=self.device)
+            m.hc_out_proj.forward_into(hc_out_in_c, delta_c)
+            delta_red = tensor_model_parallel_all_reduce(delta_c)
             ext.add_slot_residual(h_bb, delta_red, h_corr_c, slot)
 
-            tok = self._sample_slot(h_corr_c, B, slot - 1)
-            self.draft_tokens[:B, slot - 1].copy_(tok)
-            if slot < K_active:
-                e_prev = self.target_lm.model.embed_input_ids(tok).to(torch.float16).contiguous()
+            if slot < K_active and use_fused_emb:
+                assert self._emb_w is not None and self._emb_norm_w is not None
+                local_logits = self._draft_local_logits(h_corr_c, B)
+                part_v, part_i = self._sample_slot_parts(local_logits, B, slot - 1)
+                packed_emb = torch.empty(
+                    (world, B, 8 + H_DIM), dtype=torch.float16, device=self.device
+                )
+                ext.pick_pack_with_embed(
+                    part_v,
+                    part_i,
+                    self._emb_w,
+                    self._emb_norm_w,
+                    m.hc_embed_norm,
+                    packed_emb,
+                    id_base,
+                    rank,
+                    world,
+                    EPS,
+                )
+                packed_red = tensor_model_parallel_all_reduce(packed_emb)
+                ext.unpack_tok_and_inp_c(
+                    packed_red,
+                    h_bb,
+                    m.hc_hidden_norm,
+                    self.draft_tokens,
+                    inp_c,
+                    slot - 1,
+                    slot + 1,
+                    world,
+                    EPS,
+                )
+            else:
+                tok = self._sample_slot(h_corr_c, B, slot - 1)
+                self.draft_tokens[:B, slot - 1].copy_(tok)
+                if slot < K_active:
+                    e_prev = self.target_lm.model.embed_input_ids(tok).to(torch.float16).contiguous()
+                    ext.stage_c_prep(h_bb, e_prev, m.hc_hidden_norm, m.hc_embed_norm, inp_c, slot + 1, EPS)
 
     def _k_for(self, num_reqs: int) -> int:
         if self._spec_k_cfg is None:
