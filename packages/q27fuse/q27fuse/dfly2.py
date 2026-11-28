@@ -350,7 +350,6 @@ class Q27DFly2DraftModel(nn.Module):
         self.register_buffer("hc_q_norm", sd["hidden_correction.attention.q_norm.weight"].to(device=device, dtype=torch.float16).contiguous(), persistent=False)
         self.register_buffer("hc_k_blk_norm", sd["hidden_correction.attention.k_blk_norm.weight"].to(device=device, dtype=torch.float16).contiguous(), persistent=False)
 
-        self.register_buffer("hc_block_gate_w", sd["hidden_correction.attention.block_gate.weight"][r * 6:(r + 1) * 6, :].to(device=device, dtype=torch.float16).contiguous(), persistent=False)
         self.register_buffer("hc_block_gate_bias", sd["hidden_correction.attention.block_gate_bias"][r * 6:(r + 1) * 6, :].to(device=device, dtype=torch.float16).contiguous(), persistent=False)
         self.register_buffer("hc_block_rel_bias", sd["hidden_correction.attention.block_rel_bias"][r * 6:(r + 1) * 6, :].to(device=device, dtype=torch.float16).contiguous(), persistent=False)
         self.register_buffer("hc_block_sink", sd["hidden_correction.attention.block_sink"][r * 6:(r + 1) * 6].to(device=device, dtype=torch.float16).contiguous(), persistent=False)
@@ -361,13 +360,21 @@ class Q27DFly2DraftModel(nn.Module):
         hc_k_p = _load_linear_shard(sd, "hidden_correction.attention.k_blk_proj", 0, r * 256, (r + 1) * 256, device)
         hc_v_p = _load_linear_shard(sd, "hidden_correction.attention.v_blk_proj", 0, r * 256, (r + 1) * 256, device)
 
-        self.hc_mega_proj = _concat_qpn8([hc_gate_p, hc_up_p, hc_q_p, hc_k_p, hc_v_p], device)
+        # Merge block_gate [6, 10240] (padded to 128 rows for QPN8/fp8_lin col alignment -> 4736 cols) into hc_mega_proj!
+        bg_w = sd["hidden_correction.attention.block_gate.weight"][r * 6:(r + 1) * 6, :].float()
+        bg_pad = torch.zeros((128, 2 * H_DIM), dtype=torch.float32)
+        bg_pad[:6].copy_(bg_w)
+        bg_sc = (bg_pad.abs().amax(dim=1) / 448.0).clamp_min(1e-12)
+        bg_q8 = (bg_pad / bg_sc[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        self.hc_mega_proj = _concat_qpn8([hc_gate_p, hc_up_p, hc_q_p, hc_k_p, hc_v_p, (bg_q8, bg_sc)], device)
         self.hc_kv0_proj = _concat_qpn8([hc_k_p, hc_v_p], device)
 
+        # Merge hc_down_proj [5120, 1280] + hc_o_proj [5120, 1536] -> single hc_out_proj [5120, 2816] (saves 5 GEMMs + 5 add_)
         hc_dn_w, hc_dn_s = _load_linear_shard(sd, "hidden_correction.down_proj", 1, r * 1280, (r + 1) * 1280, device)
-        self.hc_down_proj = _make_qpn8(hc_dn_w, hc_dn_s, device)
         hc_o_w, hc_o_s = _load_linear_shard(sd, "hidden_correction.attention.o_proj", 1, r * 1536, (r + 1) * 1536, device)
-        self.hc_o_proj = _make_qpn8(hc_o_w, hc_o_s, device)
+        dn_f = (hc_dn_w.float() * hc_dn_s.float()[:, None]) if (hc_dn_s is not None and hc_dn_w.dtype == torch.float8_e4m3fn) else hc_dn_w.float()
+        o_f = (hc_o_w.float() * hc_o_s.float()[:, None]) if (hc_o_s is not None and hc_o_w.dtype == torch.float8_e4m3fn) else hc_o_w.float()
+        self.hc_out_proj = QPN8Linear.from_dense(torch.cat([dn_f, o_f], dim=1).contiguous(), device)
 
         del sd
         if r == 0:
@@ -440,6 +447,10 @@ class Q27DFly2Speculator(BaseSpeculator):
         self._capture_counts_by_k: dict[int, list[int]] = {}
         self._use_graphs = (os.environ.get("Q27_DFLY2_GRAPH", "1") or "1").strip() != "0"
         self._head_mode = (os.environ.get("Q27_DFLY2_HEAD", "auto") or "auto").strip().lower()
+        self._fuse_emb_ar = (os.environ.get("Q27_DFLY2_FUSE_EMB_AR", "1") or "1").strip() != "0"
+        self._can_fuse_emb_ar = False
+        self._emb_w: torch.Tensor | None = None
+        self._emb_vstart = 0
         self._kv_ready = False
 
     def set_req_states(self, req_states) -> None:
@@ -458,8 +469,10 @@ class Q27DFly2Speculator(BaseSpeculator):
         self.target_model = target_model
         self.target_lm = _resolve_target_lm(target_model)
 
-        # Compile dfly2_ops.cu outside capture
+        # Compile dfly2_ops.cu and tail_ops.cu outside capture (avoid first-request JIT stall)
         dfly2_ext()
+        from . import tail as _tail
+        _tail.ext()
 
         # Load quantized DFly2-KV weights
         self.model = Q27DFly2DraftModel(ckpt_path(), self.device, self.tp_rank, self.tp_size)
@@ -482,6 +495,33 @@ class Q27DFly2Speculator(BaseSpeculator):
                 log.warning("q27fuse.dfly2: draftscreen init failed (%r); using exact target head", e)
                 self.screen_head = None
 
+        # Detect VocabParallelEmbedding matching lm_head shard ranges for fused single-AR embed exchange
+        emb_mod = getattr(self.target_lm.model, "embed_tokens", None)
+        emb_w = getattr(emb_mod, "weight", None)
+        emb_sh = getattr(emb_mod, "shard_indices", None)
+        lm_head = self.target_lm.lm_head
+        sh = getattr(lm_head, "shard_indices", None)
+        if (
+            self._fuse_emb_ar
+            and self.draft_logits is None
+            and self.tp_size > 1
+            and emb_w is not None
+            and emb_w.is_cuda
+            and emb_w.dtype == torch.float16
+            and emb_w.dim() == 2
+            and emb_w.shape[1] == H_DIM
+            and sh is not None
+            and emb_sh is not None
+            and int(emb_sh.org_vocab_start_index) == int(sh.org_vocab_start_index)
+            and int(emb_sh.org_vocab_end_index) >= int(sh.org_vocab_end_index)
+            and not getattr(emb_mod, "num_added_embeddings", 0)
+        ):
+            self._emb_w = emb_w.contiguous()
+            self._emb_vstart = int(sh.org_vocab_start_index)
+            self._can_fuse_emb_ar = True
+            if self.tp_rank == 0:
+                log.warning("q27fuse.dfly2: fused single-AR Stage C token+embed exchange active (B<=8)")
+
         # Allocate static GPU scratch buffers NOW (before KV cache sizing!)
         self._alloc_scratch_buffers()
 
@@ -503,10 +543,9 @@ class Q27DFly2Speculator(BaseSpeculator):
             "anchor_pos": torch.zeros(B, dtype=torch.int32, device=dev),
             "prev_hidden": torch.zeros(B, H_DIM, dtype=torch.float16, device=dev),
             "req_slots": torch.zeros(B, dtype=torch.int32, device=dev),
-            # Stage A
+            # Stage A (eh_out allocated inside _run_dfly2_core for zero-copy CustomAllReduce IPC)
             "eh_in_local": torch.empty(B, 2560, dtype=torch.float16, device=dev),
-            "eh_out": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
-            # Stage B
+            # Stage B (o_part_b allocated inside _run_dfly2_core for zero-copy CustomAllReduce IPC)
             "h_block": torch.empty(N6, H_DIM, dtype=torch.float16, device=dev),
             "res_f32": torch.empty(N6, H_DIM, dtype=torch.float32, device=dev),
             "x_norm": torch.empty(N6, H_DIM, dtype=torch.float16, device=dev),
@@ -517,21 +556,16 @@ class Q27DFly2Speculator(BaseSpeculator):
             "o_ctx_b": torch.empty(N6, NQ_LOCAL, HD, dtype=torch.float16, device=dev),
             "lse_ctx_b": torch.empty(N6, NQ_LOCAL, dtype=torch.float32, device=dev),
             "attn_out_b": torch.empty(N6, NQ_LOCAL * HD, dtype=torch.float16, device=dev),
-            "o_part_b": torch.empty(N6, H_DIM, dtype=torch.float16, device=dev),
-            # Stage C
+            # Stage C (mega_c has merged 128-padded block_gate at 4608..4614; hc_out_in_c packs [mid_c(1280) | attn_out_c(1536)])
             "inp_c": torch.empty(B, 2 * H_DIM, dtype=torch.float16, device=dev),
             "kv0_c": torch.empty(B, 512, dtype=torch.float16, device=dev),
-            "mega_c": torch.empty(B, 4608, dtype=torch.float16, device=dev),
+            "mega_c": torch.empty(B, 4736, dtype=torch.float16, device=dev),
+            "hc_out_in_c": torch.empty(B, 1280 + 1536, dtype=torch.float16, device=dev),
             "q_c": torch.empty(B, NQ_LOCAL, HD, dtype=torch.float16, device=dev),
             "blk_k_c": torch.empty(B, BLK, HD, dtype=torch.float16, device=dev),
             "blk_v_c": torch.empty(B, BLK, HD, dtype=torch.float16, device=dev),
             "o_ctx_c": torch.empty(B, NQ_LOCAL, HD, dtype=torch.float16, device=dev),
-            "mid_c": torch.empty(B, 1280, dtype=torch.float16, device=dev),
-            "attn_out_c": torch.empty(B, 1536, dtype=torch.float16, device=dev),
-            "delta_mlp": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
-            "delta_attn": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
             "h_corr": torch.empty(B, H_DIM, dtype=torch.float16, device=dev),
-            "gate_raw": torch.empty(B, NQ_LOCAL, dtype=torch.float16, device=dev),
             "top1_pairs": torch.empty(B, 2, dtype=torch.float32, device=dev),
             "slot_pos_tmp": torch.empty(B, dtype=torch.int32, device=dev),
         }
@@ -663,6 +697,20 @@ class Q27DFly2Speculator(BaseSpeculator):
         )
         return out_exact, None
 
+    def _local_top1_pair(self, h_corr: torch.Tensor, B: int) -> torch.Tensor | None:
+        """Compute rank-local (best_score_f32, global_tok_f32) [B, 2] without any TP communication."""
+        if self.screen_head is not None and B <= self.screen_head.maxr:
+            p = self.screen_head.maybe_get_sm70_lm_head_top1_pair(h_corr)
+            if p is not None:
+                return p
+        lm_head = self.target_lm.lm_head
+        hc = getattr(lm_head, "q27_head", None)
+        if hc is not None and 1 <= B <= 128:
+            pairs = self._bufs["top1_pairs"][:B]
+            hc.top1(h_corr, out_ptr=pairs.data_ptr())
+            return pairs
+        return None
+
     def _top1_draft_token(self, h_corr: torch.Tensor, B: int, slot_idx: int) -> torch.Tensor:
         """Select next draft token from h_corr [B, 5120] using draftscreen, HeadCopy.top1, or gumbel."""
         if self.draft_logits is not None:
@@ -721,7 +769,8 @@ class Q27DFly2Speculator(BaseSpeculator):
         # ---- Stage A: anchor embedding + MTPFusion + 6-token block init + Layer 0 input_layernorm ----
         e0 = self.target_lm.model.embed_tokens(anchor_tok)   # [B, 5120] fp16
         eh_in = bufs["eh_in_local"][:B]
-        eh_out = bufs["eh_out"][:B]
+        # Allocate AllReduce inputs inside graph capture so CustomAllReduce uses zero-copy IPC!
+        eh_out = torch.empty((B, H_DIM), dtype=torch.float16, device=self.device)
         ext.stage_a_prep(prev_hidden, e0, m.mtp_hnorm, m.mtp_enorm, eh_in, self.tp_rank, EPS)
         m.eh_proj.forward_into(eh_in, eh_out)
         eh_red = tensor_model_parallel_all_reduce(eh_out)
@@ -740,7 +789,6 @@ class Q27DFly2Speculator(BaseSpeculator):
         o_ctx_b = bufs["o_ctx_b"][:N6]
         lse_ctx_b = bufs["lse_ctx_b"][:N6]
         attn_out_b = bufs["attn_out_b"][:N6]
-        o_part_b = bufs["o_part_b"][:N6]
         mlp_ws = ops.workspace(self.device, max(2 * I_LOCAL * H_DIM, H_DIM * I_LOCAL)) if N6 > ops.MLP_MAX else e0.new_empty(0)
         mlp_mid_b = bufs.get("mlp_mid_b")
         mlp_out_b = bufs.get("mlp_out_b")
@@ -754,6 +802,7 @@ class Q27DFly2Speculator(BaseSpeculator):
                 li, q_b, B, BLK, ctx_len_6, o_ctx_b, lse_ctx_b, anchor_pos, BLK, 0, skip_attn=skip_attn,
             )
             ext.stage_b_merge(o_in, lse_ctx_b, q_b, k_blk_b, v_blk_b, qkv_b, w_v_up_cm, attn_out_b, SCALE)
+            o_part_b = torch.empty((N6, H_DIM), dtype=torch.float16, device=self.device)
             layer.o_proj.forward_into(attn_out_b, o_part_b)
             if has_fused_arn:
                 x_norm, res_f32 = torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm(
@@ -786,20 +835,20 @@ class Q27DFly2Speculator(BaseSpeculator):
 
         # ---- Stage C: Autoregressive AttentiveCorrection slots 1..K_active ----
         mega_c = bufs["mega_c"][:B]
+        gate_raw = mega_c[:, 4608:4614]
+        hc_out_in_c = bufs["hc_out_in_c"][:B]
+        mid_c = hc_out_in_c[:, :1280]
+        attn_out_c = hc_out_in_c[:, 1280:]
         q_c = bufs["q_c"][:B]
         o_ctx_c = bufs["o_ctx_c"][:B]
-        mid_c = bufs["mid_c"][:B]
-        attn_out_c = bufs["attn_out_c"][:B]
-        delta_mlp = bufs["delta_mlp"][:B]
-        delta_attn = bufs["delta_attn"][:B]
         h_corr = bufs["h_corr"][:B]
-        gate_raw = bufs["gate_raw"][:B]
 
-        e_prev = e0
+        # Prepare slot 1 input once before the loop
+        ext.stage_c_prep(h_bb, e0, m.hc_hidden_norm, m.hc_embed_norm, inp_c, 1, EPS)
+        use_fused_emb = bool(self._can_fuse_emb_ar and self.tp_size > 1 and B <= 8)
+
         for slot in range(1, K_active + 1):
-            ext.stage_c_prep(h_bb, e_prev, m.hc_hidden_norm, m.hc_embed_norm, inp_c, slot, EPS)
             m.hc_mega_proj.forward_into(inp_c, mega_c)
-            torch.matmul(inp_c, m.hc_block_gate_w.T, out=gate_raw)
             ext.stage_c_qk_silu(mega_c, anchor_pos, m.hc_q_norm, m.hc_k_blk_norm,
                                 q_c, blk_k_c, blk_v_c, mid_c, slot, EPS)
             o_in_c, w_v_up_c = self._run_target_kv_attn(
@@ -808,16 +857,30 @@ class Q27DFly2Speculator(BaseSpeculator):
             ext.stage_c_combine(o_in_c, q_c, blk_k_c, blk_v_c, gate_raw,
                                 m.hc_block_gate_bias, m.hc_block_rel_bias, m.hc_block_sink,
                                 w_v_up_c, attn_out_c, slot, SCALE)
-            m.hc_down_proj.forward_into(mid_c, delta_mlp)
-            m.hc_o_proj.forward_into(attn_out_c, delta_attn)
-            delta_mlp.add_(delta_attn)
-            delta_red = tensor_model_parallel_all_reduce(delta_mlp)
+            delta_c = torch.empty((B, H_DIM), dtype=torch.float16, device=self.device)
+            m.hc_out_proj.forward_into(hc_out_in_c, delta_c)
+            delta_red = tensor_model_parallel_all_reduce(delta_c)
             ext.add_slot_residual(h_bb, delta_red, h_corr, slot)
 
-            tok = self._top1_draft_token(h_corr, B, slot - 1)
-            self.draft_tokens[:B, slot - 1].copy_(tok)
-            if slot < K_active:
-                e_prev = self.target_lm.model.embed_tokens(tok.to(torch.int32))
+            pairs = self._local_top1_pair(h_corr, B) if (slot < K_active and use_fused_emb) else None
+            if pairs is not None:
+                assert self._emb_w is not None
+                packed_emb = torch.empty((self.tp_size, B, 8 + H_DIM), dtype=torch.float16, device=self.device)
+                ext.pick_pack_with_embed(
+                    pairs, self._emb_w, m.hc_embed_norm, packed_emb,
+                    self._emb_vstart, self.tp_rank, self.tp_size, EPS,
+                )
+                packed_red = tensor_model_parallel_all_reduce(packed_emb)
+                ext.unpack_tok_and_inp_c(
+                    packed_red, h_bb, m.hc_hidden_norm, self.draft_tokens, inp_c,
+                    slot - 1, slot + 1, self.tp_size, EPS,
+                )
+            else:
+                tok = self._top1_draft_token(h_corr, B, slot - 1)
+                self.draft_tokens[:B, slot - 1].copy_(tok)
+                if slot < K_active:
+                    e_prev = self.target_lm.model.embed_tokens(tok.to(torch.int32))
+                    ext.stage_c_prep(h_bb, e_prev, m.hc_hidden_norm, m.hc_embed_norm, inp_c, slot + 1, EPS)
 
     def _k_for(self, num_reqs: int) -> int:
         if self._spec_k_cfg is None:

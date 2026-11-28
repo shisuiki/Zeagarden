@@ -542,14 +542,14 @@ k_stage_c_slot0_kv(const __half* __restrict__ kv0, const int* __restrict__ ancho
 }
 
 // =================================================================================================
-// 9. dfly2_stage_c_qk_silu: split mega [B, 4608] -> silu(gate)*up -> out_in[:, 0:1280],
+// 9. dfly2_stage_c_qk_silu: split mega [B, mega_stride] -> silu(gate)*up -> out_in[:, 0:1280],
 //    q_norm+RoPE -> q_out [B, 6, 256], k_blk_norm+RoPE -> blk_k/v[b, slot, :]
 // =================================================================================================
 __global__ void __launch_bounds__(256)
 k_stage_c_qk_silu(const __half* __restrict__ mega, const int* __restrict__ anchor_pos,
                   const __half* __restrict__ q_norm_w, const __half* __restrict__ k_blk_norm_w,
                   __half* __restrict__ q_out, __half* __restrict__ blk_k, __half* __restrict__ blk_v,
-                  __half* __restrict__ out_in, int slot, float eps) {
+                  __half* __restrict__ out_in, int mega_stride, int out_stride, int slot, float eps) {
   // 8 warps per request b:
   //   warps 0..5: Q heads (offset 2560 + h * 256)
   //   warp 6:     K/V block (offset 4096 / 4352)
@@ -558,7 +558,7 @@ k_stage_c_qk_silu(const __half* __restrict__ mega, const int* __restrict__ ancho
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const float pos = (float)(anchor_pos[b] + slot);
-  const __half* mrow = mega + (int64_t)b * 4608;
+  const __half* mrow = mega + (int64_t)b * mega_stride;
 
   if (warp < NQ) {
     const __half* src = mrow + 2560 + warp * HD;
@@ -619,7 +619,7 @@ k_stage_c_qk_silu(const __half* __restrict__ mega, const int* __restrict__ ancho
   } else {
     const __half2* g2 = reinterpret_cast<const __half2*>(mrow);
     const __half2* u2 = reinterpret_cast<const __half2*>(mrow + HC_MLP_I);
-    __half2* dst2 = reinterpret_cast<__half2*>(out_in + (int64_t)b * HC_MLP_I);
+    __half2* dst2 = reinterpret_cast<__half2*>(out_in + (int64_t)b * out_stride);
     for (int i = lane; i < HC_MLP_I / 2; i += 32) {
       const float2 gf = __half22float2(g2[i]);
       const float2 uf = __half22float2(u2[i]);
@@ -633,7 +633,7 @@ k_stage_c_qk_silu(const __half* __restrict__ mega, const int* __restrict__ ancho
 // =================================================================================================
 // 10. dfly2_stage_c_combine: causal 1 x (slot+1) block attention with block_rel_bias + block_sink,
 //     gated by tanh(gate_raw + block_gate_bias[:, slot]), added to ctx_out (Exact or GLA v_up),
-//     written straight into out_in[:, 1280:2816].
+//     written straight into out_in[:, 0:1536] with row stride out_stride.
 // =================================================================================================
 template <int R_LAT>
 __global__ void __launch_bounds__(192)
@@ -642,7 +642,7 @@ k_stage_c_combine(const __half* __restrict__ o_in, const __half* __restrict__ q_
                   const __half* __restrict__ gate_raw, const __half* __restrict__ block_gate_bias,
                   const __half* __restrict__ block_rel_bias, const __half* __restrict__ block_sink,
                   const __half* __restrict__ w_v_up_cm, __half* __restrict__ out_in,
-                  int slot, int bias_stride, float scale) {
+                  int gate_stride, int out_stride, int slot, int bias_stride, float scale) {
   // Grid: (B,), 6 warps (one per local Q head h = 0..5)
   __shared__ __align__(16) __half sk[BLK * HD];
   __shared__ __align__(16) __half sv[BLK * HD];
@@ -696,9 +696,9 @@ k_stage_c_combine(const __half* __restrict__ o_in, const __half* __restrict__ q_
   const float inv_Z = 1.0f / Z;
   for (int j = 0; j < n_vis; j++) w_j[j] *= inv_Z;
 
-  const float g_val = tanhf(__half2float(gate_raw[(int64_t)b * NQ + h]) +
+  const float g_val = tanhf(__half2float(gate_raw[(int64_t)b * gate_stride + h]) +
                             __half2float(block_gate_bias[h * bias_stride + slot]));
-  __half* dst = out_in + (int64_t)b * (NQ * HD) + h * HD;
+  __half* dst = out_in + (int64_t)b * out_stride + h * HD;
 
 #pragma unroll
   for (int k = 0; k < 8; k++) {
@@ -764,6 +764,139 @@ k_gemma_rmsnorm_res(const __half* __restrict__ x, float* __restrict__ res, const
   for (int i = tid; i < H_DIM / 2; i += 256) {
     const float2 wf = __half22float2(w2[i]);
     o2[i] = __floats2half2_rn(rr[2 * i] * inv * (1.0f + wf.x), rr[2 * i + 1] * inv * (1.0f + wf.y));
+  }
+}
+
+// =================================================================================================
+// 13. Fused Single-AR Stage C Token + Normalized Embedding Exchange (B <= 8)
+//     Eliminates separate top-1 AllReduce + VocabParallelEmbedding AllReduce + stage_c_prep!
+//     Header encodes float32 score (3 x 11-bit exact FP16 ints) + int32 token id (2 x 11-bit exact
+//     FP16 ints) so elementwise FP16 AllReduce across disjoint rank slices is 100% bit-exact.
+// =================================================================================================
+constexpr int PACK_EMB_STRIDE = 8 + H_DIM;   // 5128 fp16s (10256 B, 16-byte aligned)
+
+__global__ void __launch_bounds__(256)
+k_pick_pack_with_embed(
+    const float* __restrict__ pairs,         // [B, 2] (val_f32, global_tok_f32)
+    const __half* __restrict__ emb_w,        // [V_shard, 5120] fp16
+    const __half* __restrict__ hc_enorm_w,   // [5120] fp16 (zero-centered Gemma norm)
+    __half* __restrict__ packed_out,         // [world, B, 5128] fp16
+    int emb_vstart,
+    int emb_vsize,
+    int rank,
+    int B,
+    float eps) {
+  __shared__ float sm[8];
+  __shared__ int s_lid;
+  const int r = blockIdx.x;
+  const int b = blockIdx.y;
+  const int tid = threadIdx.x;
+  __half* dst = packed_out + ((int64_t)r * B + b) * PACK_EMB_STRIDE;
+
+  if (r != rank) {
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+    for (int i = tid; i < PACK_EMB_STRIDE / 8; i += 256) dst4[i] = z;
+    return;
+  }
+
+  if (tid == 0) {
+    const float val = pairs[(int64_t)b * 2];
+    const int gid = (int)lrintf(pairs[(int64_t)b * 2 + 1]);
+    const uint32_t vb = __float_as_uint(val);
+    const uint32_t tb = (uint32_t)(gid >= 0 ? gid : 0);
+    dst[0] = __float2half_rn((float)(vb & 2047u));
+    dst[1] = __float2half_rn((float)((vb >> 11) & 2047u));
+    dst[2] = __float2half_rn((float)((vb >> 22) & 1023u));
+    dst[3] = __float2half_rn((float)(tb & 2047u));
+    dst[4] = __float2half_rn((float)((tb >> 11) & 2047u));
+    dst[5] = __float2half_rn(0.f);
+    dst[6] = __float2half_rn(0.f);
+    dst[7] = __float2half_rn(0.f);
+    int lid = gid - emb_vstart;
+    if (lid < 0) lid = 0;
+    if (lid >= emb_vsize) lid = emb_vsize - 1;
+    s_lid = lid;
+  }
+  __syncthreads();
+
+  const __half2* e2 = reinterpret_cast<const __half2*>(emb_w + (int64_t)s_lid * H_DIM);
+  const __half2* w2 = reinterpret_cast<const __half2*>(hc_enorm_w);
+  __half2* o2 = reinterpret_cast<__half2*>(dst + 8);
+
+  float ss = 0.f;
+  for (int i = tid; i < H_DIM / 2; i += 256) {
+    const float2 v = __half22float2(e2[i]);
+    ss = fmaf(v.x, v.x, fmaf(v.y, v.y, ss));
+  }
+  const float inv = rsqrtf(bsum256(ss, sm) * (1.0f / (float)H_DIM) + eps);
+  for (int i = tid; i < H_DIM / 2; i += 256) {
+    const float2 xf = __half22float2(e2[i]);
+    const float2 wf = __half22float2(w2[i]);
+    o2[i] = __floats2half2_rn(xf.x * inv * (1.0f + wf.x), xf.y * inv * (1.0f + wf.y));
+  }
+}
+
+__global__ void __launch_bounds__(256)
+k_unpack_tok_and_inp_c(
+    const __half* __restrict__ packed_in,    // [world, B, 5128] fp16 (post-AllReduce)
+    const __half* __restrict__ h_bb,         // [B*6, 5120] fp16
+    const __half* __restrict__ hc_hnorm_w,   // [5120] fp16 (zero-centered Gemma norm)
+    int64_t* __restrict__ draft_tokens,      // [B, draft_stride] int64
+    __half* __restrict__ inp_c,              // [B, 10240] fp16
+    int draft_stride,
+    int step,
+    int next_slot,
+    int B,
+    int world,
+    float eps) {
+  __shared__ float sm[8];
+  __shared__ int s_best_r;
+  const int b = blockIdx.x;
+  const int which = blockIdx.y;   // 0 = pick winner + copy e_normed; 1 = norm h_bb[next_slot]
+  const int tid = threadIdx.x;
+
+  if (which == 0) {
+    if (tid == 0) {
+      float best_v = -INFINITY;
+      int64_t best_t = 0;
+      int best_r = 0;
+      for (int r = 0; r < world; r++) {
+        const __half* p = packed_in + ((int64_t)r * B + b) * PACK_EMB_STRIDE;
+        const uint32_t vb = ((uint32_t)__half2int_rn(p[0]))
+                          | ((uint32_t)__half2int_rn(p[1]) << 11)
+                          | ((uint32_t)__half2int_rn(p[2]) << 22);
+        const float v = __uint_as_float(vb);
+        const int64_t t = ((int64_t)__half2int_rn(p[3])) | ((int64_t)__half2int_rn(p[4]) << 11);
+        if (r == 0 || v > best_v || (v == best_v && t < best_t)) {
+          best_v = v;
+          best_t = t;
+          best_r = r;
+        }
+      }
+      draft_tokens[(int64_t)b * draft_stride + step] = best_t;
+      s_best_r = best_r;
+    }
+    __syncthreads();
+    const uint4* src = reinterpret_cast<const uint4*>(
+        packed_in + ((int64_t)s_best_r * B + b) * PACK_EMB_STRIDE + 8);
+    uint4* dst = reinterpret_cast<uint4*>(inp_c + (int64_t)b * (2 * H_DIM) + H_DIM);
+    for (int i = tid; i < H_DIM / 8; i += 256) dst[i] = src[i];
+  } else {
+    const __half2* s2 = reinterpret_cast<const __half2*>(h_bb + (int64_t)(b * BLK + next_slot) * H_DIM);
+    const __half2* w2 = reinterpret_cast<const __half2*>(hc_hnorm_w);
+    __half2* d2 = reinterpret_cast<__half2*>(inp_c + (int64_t)b * (2 * H_DIM));
+    float ss = 0.f;
+    for (int i = tid; i < H_DIM / 2; i += 256) {
+      const float2 v = __half22float2(s2[i]);
+      ss = fmaf(v.x, v.x, fmaf(v.y, v.y, ss));
+    }
+    const float inv = rsqrtf(bsum256(ss, sm) * (1.0f / (float)H_DIM) + eps);
+    for (int i = tid; i < H_DIM / 2; i += 256) {
+      const float2 xf = __half22float2(s2[i]);
+      const float2 wf = __half22float2(w2[i]);
+      d2[i] = __floats2half2_rn(xf.x * inv * (1.0f + wf.x), xf.y * inv * (1.0f + wf.y));
+    }
   }
 }
 
@@ -965,7 +1098,8 @@ void dfly2_stage_c_qk_silu(torch::Tensor mega, torch::Tensor anchor_pos, torch::
       reinterpret_cast<__half*>(q_out.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(blk_k.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(blk_v.data_ptr<at::Half>()),
-      reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()), (int)slot, (float)eps);
+      reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()),
+      (int)mega.stride(0), (int)out_in.stride(0), (int)slot, (float)eps);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "dfly2_stage_c_qk_silu failed");
 }
 
@@ -978,6 +1112,8 @@ void dfly2_stage_c_combine(torch::Tensor o_in, torch::Tensor q_in, torch::Tensor
   const at::cuda::CUDAGuard guard(q_in.device());
   auto st = at::cuda::getCurrentCUDAStream();
   const int bias_stride = (int)block_gate_bias.size(1);
+  const int gate_stride = (int)gate_raw.stride(0);
+  const int out_stride = (int)out_in.stride(0);
   const bool gla = w_v_up_cm.has_value() && w_v_up_cm->defined() && w_v_up_cm->numel() > 0;
   const int r_lat = gla ? (int)w_v_up_cm->size(0) : 0;
   const __half* wv = gla ? reinterpret_cast<const __half*>(w_v_up_cm->data_ptr<at::Half>()) : nullptr;
@@ -991,7 +1127,8 @@ void dfly2_stage_c_combine(torch::Tensor o_in, torch::Tensor q_in, torch::Tensor
         reinterpret_cast<const __half*>(block_gate_bias.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(block_rel_bias.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(block_sink.data_ptr<at::Half>()), nullptr,
-        reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()), (int)slot, bias_stride, (float)scale);
+        reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()),
+        gate_stride, out_stride, (int)slot, bias_stride, (float)scale);
   } else if (r_lat == 192) {
     k_stage_c_combine<192><<<(unsigned)B, 192, 0, st>>>(
         reinterpret_cast<const __half*>(o_in.data_ptr<at::Half>()),
@@ -1002,7 +1139,8 @@ void dfly2_stage_c_combine(torch::Tensor o_in, torch::Tensor q_in, torch::Tensor
         reinterpret_cast<const __half*>(block_gate_bias.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(block_rel_bias.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(block_sink.data_ptr<at::Half>()), wv,
-        reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()), (int)slot, bias_stride, (float)scale);
+        reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()),
+        gate_stride, out_stride, (int)slot, bias_stride, (float)scale);
   } else {
     TORCH_CHECK(r_lat == 256, "dfly2_stage_c_combine: r_lat must be 0, 192, or 256");
     k_stage_c_combine<256><<<(unsigned)B, 192, 0, st>>>(
@@ -1014,7 +1152,8 @@ void dfly2_stage_c_combine(torch::Tensor o_in, torch::Tensor q_in, torch::Tensor
         reinterpret_cast<const __half*>(block_gate_bias.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(block_rel_bias.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(block_sink.data_ptr<at::Half>()), wv,
-        reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()), (int)slot, bias_stride, (float)scale);
+        reinterpret_cast<__half*>(out_in.data_ptr<at::Half>()),
+        gate_stride, out_stride, (int)slot, bias_stride, (float)scale);
   }
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "dfly2_stage_c_combine failed");
 }
@@ -1041,6 +1180,58 @@ void dfly2_gemma_rmsnorm_res(torch::Tensor x, torch::Tensor res, torch::Tensor w
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "dfly2_gemma_rmsnorm_res failed");
 }
 
+void dfly2_pick_pack_with_embed(
+    torch::Tensor pairs,
+    torch::Tensor emb_w,
+    torch::Tensor hc_enorm_w,
+    torch::Tensor packed_out,
+    int64_t emb_vstart,
+    int64_t rank,
+    int64_t world,
+    double eps) {
+  const int B = (int)pairs.size(0);
+  if (B <= 0) return;
+  TORCH_CHECK(pairs.is_contiguous() && pairs.dtype() == torch::kFloat && pairs.size(1) == 2);
+  TORCH_CHECK(emb_w.is_contiguous() && emb_w.dtype() == torch::kHalf && emb_w.size(1) == H_DIM);
+  TORCH_CHECK(packed_out.is_contiguous() && packed_out.dtype() == torch::kHalf
+              && packed_out.numel() == world * B * PACK_EMB_STRIDE);
+  const at::cuda::CUDAGuard guard(pairs.device());
+  dim3 grid((unsigned)world, (unsigned)B);
+  k_pick_pack_with_embed<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      pairs.data_ptr<float>(),
+      reinterpret_cast<const __half*>(emb_w.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(hc_enorm_w.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(packed_out.data_ptr<at::Half>()),
+      (int)emb_vstart, (int)emb_w.size(0), (int)rank, B, (float)eps);
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "dfly2_pick_pack_with_embed failed");
+}
+
+void dfly2_unpack_tok_and_inp_c(
+    torch::Tensor packed_in,
+    torch::Tensor h_bb,
+    torch::Tensor hc_hnorm_w,
+    torch::Tensor draft_tokens,
+    torch::Tensor inp_c,
+    int64_t step,
+    int64_t next_slot,
+    int64_t world,
+    double eps) {
+  const int B = (int)inp_c.size(0);
+  if (B <= 0) return;
+  TORCH_CHECK(packed_in.is_contiguous() && packed_in.dtype() == torch::kHalf
+              && packed_in.numel() == world * B * PACK_EMB_STRIDE);
+  const at::cuda::CUDAGuard guard(inp_c.device());
+  dim3 grid((unsigned)B, 2u);
+  k_unpack_tok_and_inp_c<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __half*>(packed_in.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(h_bb.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(hc_hnorm_w.data_ptr<at::Half>()),
+      draft_tokens.data_ptr<int64_t>(),
+      reinterpret_cast<__half*>(inp_c.data_ptr<at::Half>()),
+      (int)draft_tokens.stride(0), (int)step, (int)next_slot, B, (int)world, (float)eps);
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "dfly2_unpack_tok_and_inp_c failed");
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("extract_inputs", &dfly2_extract_inputs);
   m.def("stage_a_prep", &dfly2_stage_a_prep);
@@ -1054,4 +1245,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("stage_c_combine", &dfly2_stage_c_combine);
   m.def("add_slot_residual", &dfly2_add_slot_residual);
   m.def("gemma_rmsnorm_res", &dfly2_gemma_rmsnorm_res);
+  m.def("pick_pack_with_embed", &dfly2_pick_pack_with_embed);
+  m.def("unpack_tok_and_inp_c", &dfly2_unpack_tok_and_inp_c);
 }

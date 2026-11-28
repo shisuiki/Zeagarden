@@ -42,9 +42,10 @@ def register():
         bool(os.environ.get("Q27_GLA_CKPT", "").strip()),
         bool(os.environ.get("Q27_DFLY2_CKPT", "").strip()),
     )
-    from . import draftscreen, gdnv, head, patch, spec_k, tail, tail_mtp
+    from . import apc, draftscreen, gdnv, head, patch, spec_k, tail, tail_mtp
 
     has_dfly2 = bool(os.environ.get("Q27_DFLY2_CKPT", "").strip())
+    apc.apply()
     patch.apply()
     spec_k.apply()
     if not has_dfly2:
