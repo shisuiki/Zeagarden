@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling2 / Inkling2Loop model for Volta sm_70 on 1Cat-vLLM v1.5.3.
+"""Inkling2 / Inkling2Loop model for Volta sm_70 on 1Cat-vLLM v1.5.4.
 
 Design choices specific to Volta (sm_70):
 - Residual `stack`, `bank`, `prelude_partial`, and `attn_out` stay strictly in FP32

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling2 model configs (ported for 1Cat-vLLM v1.5.3 / Volta sm_70)."""
+"""Inkling2 model configs (ported for 1Cat-vLLM v1.5.4 / Volta sm_70)."""
 
 from __future__ import annotations
 

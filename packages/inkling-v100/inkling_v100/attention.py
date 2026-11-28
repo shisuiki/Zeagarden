@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling2 relative-bias GQA attention & 1Cat-vLLM v1.5.3 backend for Volta sm_70."""
+"""Inkling2 relative-bias GQA attention & 1Cat-vLLM v1.5.4 backend for Volta sm_70."""
 
 from __future__ import annotations
 
@@ -167,7 +167,7 @@ class Inkling2AttentionMetadataBuilder(AttentionMetadataBuilder[Inkling2Attentio
 
 
 class Inkling2AttentionBackend(AttentionBackend):
-    """Standalone 1Cat-vLLM v1.5.3 backend for Inkling2 relative-bias attention on sm_70."""
+    """Standalone 1Cat-vLLM v1.5.4 backend for Inkling2 relative-bias attention on sm_70."""
 
     @staticmethod
     def get_name() -> str:

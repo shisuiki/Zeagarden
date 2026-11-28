@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AOT-build all 9 inkling_v100 Volta (sm_70) CUDA extensions.
+# AOT-build all 13 inkling_v100 Volta (sm_70) CUDA extensions.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXT_DIR="${1:-${INKLING_V100_EXT_DIR:-$SCRIPT_DIR/inkling_v100/_ext}}"
@@ -21,9 +21,13 @@ import time
 import inkling_v100
 from inkling_v100.ops import (
     allreduce_conv_mix_cuda,
+    attn_rel_dec2_cuda,
     attn_rel_dec_cuda,
     attn_rel_gla_cuda,
     attn_rel_pf_cuda,
+    attn_rel_pf_wmma_cuda,
+    dfly2_ops_cuda,
+    ep4_moe_fused_cuda,
     ep4_route_cuda,
     fp8_dense_cuda,
     loop_blend_cuda,
@@ -35,14 +39,18 @@ t = time.time()
 print("package:", inkling_v100.__file__, flush=True)
 exts = [
     ("fp8_dense", fp8_dense_cuda.load_fp8_dense_ext),
+    ("ep4_moe_fused", ep4_moe_fused_cuda.load_ep4_moe_fused_ext),
     ("nvfp4_prefill_moe", nvfp4_prefill_cuda.load_nvfp4_prefill_ext),
+    ("attn_rel_pf_wmma", attn_rel_pf_wmma_cuda.load_attn_rel_pf_wmma_ext),
     ("attn_rel_pf", attn_rel_pf_cuda.load_attn_rel_pf_ext),
+    ("attn_rel_dec2", attn_rel_dec2_cuda.load_attn_rel_dec2_ext),
     ("attn_rel_dec", attn_rel_dec_cuda.load_attn_rel_dec_ext),
     ("attn_rel_gla", attn_rel_gla_cuda.load_attn_rel_gla_ext),
     ("mlp_mxfp8_moe", mxfp8_moe_cuda.load_mxfp8_moe_ext),
     ("ep4_route", ep4_route_cuda.load_ep4_route_ext),
     ("loop_blend", loop_blend_cuda.load_loop_blend_ext),
     ("all_reduce_conv_mix", allreduce_conv_mix_cuda.load_ar_conv_mix_ext),
+    ("dfly2_ops", dfly2_ops_cuda.load_dfly2_ops_ext),
 ]
 for name, fn in exts:
     t1 = time.time()

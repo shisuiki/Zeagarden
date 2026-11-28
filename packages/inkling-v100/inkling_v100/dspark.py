@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling2 DSpark 7-token speculative draft model (`mtp.safetensors`) for Volta sm_70.
 
-Runs natively on 1Cat-vLLM v1.5.3 with:
+Runs natively on 1Cat-vLLM v1.5.4 with:
 - Pure FP16 weights + FP32 internal accumulations (zero bf16).
 - Native `FLASH_ATTN_V100` non-causal paged draft attention with mixed SWA-1024
   (layers 0, 2) and full (layer 1) KV cache groups and FULL CUDA graph support.
