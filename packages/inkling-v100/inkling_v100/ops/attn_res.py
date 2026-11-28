@@ -259,11 +259,12 @@ def attn_res(
         enable_fp_fusion=False,
     )
     grid = (num_q, num_tokens)
-    if num_tokens * num_q <= 256:
+    if d <= 4096:
         block_a = triton.next_power_of_2(d + 1) // 2
         block_b = max(triton.next_power_of_2(d - block_a), 16)
+        nw = 8 if num_tokens * num_q <= 256 else 4
         _attn_res_row_kernel[grid](
-            *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=8
+            *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=nw
         )
     else:
         _attn_res_kernel[grid](*args, **meta, BLOCK_D=1024, num_warps=4)

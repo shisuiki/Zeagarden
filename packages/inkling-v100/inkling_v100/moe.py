@@ -468,7 +468,7 @@ class Inkling2MoE(nn.Module):
         if return_unreduced_pair:
             return self._forward_chunk(x, is_padding, reduce=False, return_unreduced_pair=True)
         num_tokens = x.shape[0]
-        chunk_cap = 2048 if self.experts._use_cuda_nvfp4_pf else 1024
+        chunk_cap = int(os.environ.get("INKLING_MOE_CHUNK_CAP", "4096"))
         if num_tokens > chunk_cap:
             out = torch.empty_like(x)
             for t0 in range(0, num_tokens, chunk_cap):

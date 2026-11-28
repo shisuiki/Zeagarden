@@ -277,30 +277,9 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         up = self.controller_gain_forget[streams]
         if self._use_cuda_loop_blend:
             return loop_blend_cuda(dest, message, down, up, norm_weight, norm_eps)
-        num_tokens = dest.shape[1]
-        if num_tokens <= 1024:
-            pair = pair_rms_norm(dest, message, out_dtype=torch.float16)
-            hidden = torch.bmm(pair, down.transpose(1, 2))
-            del pair
-            gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
-            del hidden
-            return blend_rms_norm(
-                dest, message, gain_forget, norm_weight, norm_eps, out_dtype=torch.float16
-            )
-        out = message.new_empty(message.shape, dtype=torch.float16)
-        for t0 in range(0, num_tokens, 1024):
-            t1 = min(t0 + 1024, num_tokens)
-            d_c = dest[:, t0:t1]
-            m_c = message[:, t0:t1].contiguous()
-            pair = pair_rms_norm(d_c, m_c, out_dtype=torch.float16)
-            hidden = torch.bmm(pair, down.transpose(1, 2))
-            del pair
-            gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
-            del hidden
-            out[:, t0:t1] = blend_rms_norm(
-                d_c, m_c, gain_forget, norm_weight, norm_eps, out_dtype=torch.float16
-            )
-        return out
+        return loop_blend_cuda(
+            dest, message, down, up, norm_weight, norm_eps, force_cuda=False
+        )
 
 
 class Inkling2Model(nn.Module):

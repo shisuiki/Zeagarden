@@ -171,8 +171,9 @@ def _loop_blend_reference_fallback(
     norm_weight: torch.Tensor,
     norm_eps: float,
 ) -> torch.Tensor:
-    num_tokens = dest.shape[1]
-    if num_tokens <= 1024:
+    num_streams, num_tokens, d = message.shape
+    chunk = 2048
+    if num_tokens <= chunk:
         pair = pair_rms_norm(dest, message, out_dtype=torch.float16)
         hidden = torch.bmm(pair, down.transpose(1, 2))
         del pair
@@ -182,17 +183,25 @@ def _loop_blend_reference_fallback(
             dest, message, gain_forget, norm_weight, norm_eps, out_dtype=torch.float16
         )
     out = message.new_empty(message.shape, dtype=torch.float16)
-    for t0 in range(0, num_tokens, 1024):
-        t1 = min(t0 + 1024, num_tokens)
+    rank = down.shape[1]
+    down_t = down.transpose(1, 2)
+    up_t = up.transpose(1, 2)
+    pair_buf = message.new_empty((num_streams, chunk, 2 * d), dtype=torch.float16)
+    hid_buf = message.new_empty((num_streams, chunk, rank), dtype=torch.float16)
+    gf_buf = message.new_empty((num_streams, chunk, 2 * d), dtype=torch.float32)
+    for t0 in range(0, num_tokens, chunk):
+        t1 = min(t0 + chunk, num_tokens)
+        nt = t1 - t0
         d_c = dest[:, t0:t1]
-        m_c = message[:, t0:t1].contiguous()
-        pair = pair_rms_norm(d_c, m_c, out_dtype=torch.float16)
-        hidden = torch.bmm(pair, down.transpose(1, 2))
-        del pair
-        gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
-        del hidden
-        out[:, t0:t1] = blend_rms_norm(
-            d_c, m_c, gain_forget, norm_weight, norm_eps, out_dtype=torch.float16
+        m_c = message[:, t0:t1]
+        p_c = pair_buf[:, :nt] if nt == chunk else pair_buf.view(-1)[: num_streams * nt * 2 * d].view(num_streams, nt, 2 * d)
+        h_c = hid_buf[:, :nt] if nt == chunk else hid_buf.view(-1)[: num_streams * nt * rank].view(num_streams, nt, rank)
+        g_c = gf_buf[:, :nt] if nt == chunk else gf_buf.view(-1)[: num_streams * nt * 2 * d].view(num_streams, nt, 2 * d)
+        pair_rms_norm(d_c, m_c, out_dtype=torch.float16, out=p_c)
+        torch.bmm(p_c, down_t, out=h_c)
+        torch.bmm(h_c, up_t, out_dtype=torch.float32, out=g_c)
+        blend_rms_norm(
+            d_c, m_c, g_c, norm_weight, norm_eps, out_dtype=torch.float16, out=out[:, t0:t1]
         )
     return out
 
