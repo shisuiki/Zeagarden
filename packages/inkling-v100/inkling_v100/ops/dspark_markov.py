@@ -433,3 +433,127 @@ def shard_argmax(
     if world > 1:
         packed = all_reduce(packed)
     return unpack_tokens(packed)
+
+
+@triton.jit
+def _sample_slot_chunk_kernel(
+    LOGITS,
+    stride,
+    DENSE,
+    dense_stride,
+    REQ_SLOTS,
+    ANCHOR_POS,
+    TEMP,
+    SEEDS,
+    PART_V,
+    PART_I,
+    step,
+    num_spec,
+    num_valid,
+    id_base,
+    n_chunks,
+    softcap,
+    CHUNK: tl.constexpr,
+    HAS_CAP: tl.constexpr,
+    HAS_DENSE: tl.constexpr,
+    USE_FP64: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    cols = chunk * CHUNK + tl.arange(0, CHUNK)
+    mask = cols < num_valid
+    raw = tl.load(LOGITS + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x = raw
+    if HAS_CAP:
+        x = tldevice.tanh(x / softcap) * softcap
+    rs = tl.load(REQ_SLOTS + row).to(tl.int64)
+    valid = rs >= 0
+    temp = tl.load(TEMP + rs, mask=valid, other=0.0).to(tl.float32)
+    if temp != 0.0:
+        x = x / temp
+    x = tl.where(mask, x, float("-inf"))
+    if HAS_DENSE:
+        tl.store(
+            DENSE + (rs * num_spec + step) * dense_stride + cols,
+            x,
+            mask=mask & valid,
+        )
+    seed = tl.load(SEEDS + rs, mask=valid, other=0)
+    pos = tl.load(ANCHOR_POS + row) + step
+    keys = id_base + cols
+    value, idx = gumbel_noised_argmax(
+        x,
+        keys,
+        mask,
+        seed,
+        pos,
+        temp,
+        IS_DRAFTING=True,
+        USE_FP64=USE_FP64,
+        APPLY_TEMPERATURE=False,
+    )
+    tl.store(PART_V + row * n_chunks + chunk, value)
+    tl.store(PART_I + row * n_chunks + chunk, id_base + chunk * CHUNK + idx)
+
+
+def shard_sample_slot(
+    logits: torch.Tensor,
+    req_slots: torch.Tensor,
+    anchor_pos: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    dense_local: torch.Tensor | None,
+    step: int,
+    num_spec: int,
+    softcap: float | None,
+    num_valid: int,
+    id_base: int,
+    rank: int,
+    world: int,
+    use_fp64: bool,
+    all_reduce,
+) -> torch.Tensor:
+    """Shard-local softcap + temperature + Gumbel-max sampling for one DFly2 draft slot.
+
+    Zero vocab all-gather, 100% CUDA-graph safe, handles mixed T=0 and T>0 batches,
+    and writes processed local logits into `dense_local[(rs * num_spec + step), :]`
+    for zero-all-gather `shard_rejection_sample`.
+    """
+    rows, shard = logits.shape
+    assert logits.stride(1) == 1 and id_base + shard < (1 << 18)
+    n_chunks = triton.cdiv(shard, ARGMAX_CHUNK)
+    part_v = torch.empty(
+        (rows, n_chunks),
+        dtype=torch.float64 if use_fp64 else torch.float32,
+        device=logits.device,
+    )
+    part_i = torch.empty((rows, n_chunks), dtype=torch.int32, device=logits.device)
+    has_dense = dense_local is not None
+    if rows:
+        _sample_slot_chunk_kernel[(rows, n_chunks)](
+            logits,
+            logits.stride(0),
+            dense_local if has_dense else logits,
+            dense_local.stride(0) if has_dense else 0,
+            req_slots,
+            anchor_pos,
+            temperature,
+            seeds,
+            part_v,
+            part_i,
+            int(step),
+            int(num_spec),
+            int(num_valid),
+            int(id_base),
+            n_chunks,
+            float(softcap) if softcap is not None else 1.0,
+            CHUNK=ARGMAX_CHUNK,
+            HAS_CAP=softcap is not None,
+            HAS_DENSE=has_dense,
+            USE_FP64=use_fp64,
+            num_warps=4,
+        )
+    packed = pick_pack(part_v, part_i, rank, world)
+    if world > 1:
+        packed = all_reduce(packed)
+    return unpack_tokens(packed)

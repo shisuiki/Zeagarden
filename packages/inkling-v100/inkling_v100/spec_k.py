@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adaptive DSpark verify-width K(C) controller for Inkling-2-Mini on 1Cat-vLLM v1.5.3.
+"""Adaptive speculative verify-width K(C) controller for Inkling-2-Mini (DSpark & DFly2-KV) on 1Cat-vLLM v1.5.4.
 
 Configured via `INKLING_SPEC_K="K1@n1,K2@n2,..."` (same syntax as `q27fuse.spec_k`), e.g.:
   - Static sweep:  `INKLING_SPEC_K="3@1"` (always verify K=3 draft tokens)
@@ -80,7 +80,7 @@ def apply_spec_k() -> None:
     _patch_scheduler(cfg)
     _patch_target_graphs(cfg)
     log.info(
-        "inkling_v100: adaptive DSpark K(C) enabled: %s",
+        "inkling_v100: adaptive spec K(C) enabled: %s",
         ", ".join(f"{'K' if k == -1 else k}@{n}" for n, k in cfg),
     )
 
@@ -157,7 +157,7 @@ def _patch_target_graphs(cfg: list[tuple[int, int]]) -> None:
         is_target_dspark = (
             isinstance(self, CU.ModelCudaGraphManager)
             and sc is not None
-            and sc.method == "dflash"
+            and sc.method in ("dflash", "draft_model")
         )
         max_k = sc.num_speculative_tokens if is_target_dspark else 0
         rng = k_ranges(cfg, max_k, self.max_num_reqs) if is_target_dspark else []

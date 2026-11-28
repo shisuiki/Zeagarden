@@ -1,4 +1,4 @@
-"""Volta (sm_70) plugin for serving thinkingmachines/Inkling-2-Mini on 1Cat-vLLM v1.5.3.
+"""Volta (sm_70) plugin for serving thinkingmachines/Inkling-2-Mini on 1Cat-vLLM v1.5.4.
 
 Zero edits to 1Cat-vLLM site-packages; zero interference with Qwen3.8-27B / q27fuse.
 """
@@ -25,6 +25,7 @@ def register() -> None:
     from .configs import (
         INKLING2_ARCHITECTURE,
         INKLING2_LOOP_ARCHITECTURE,
+        Inkling2DFly2Config,
         Inkling2DSparkConfig,
         Inkling2LoopMMConfig,
         Inkling2MMConfig,
@@ -38,6 +39,7 @@ def register() -> None:
     _CONFIG_REGISTRY["inkling2_model"] = Inkling2ModelConfig
     _CONFIG_REGISTRY["inkling2_loop_text"] = Inkling2ModelConfig
     _CONFIG_REGISTRY["inkling2_dspark"] = Inkling2DSparkConfig
+    _CONFIG_REGISTRY["inkling2_dfly2_kv"] = Inkling2DFly2Config
 
     # 2. Register quantization config (takes precedence over config.json's ModelOpt block).
     register_quantization_config("inkling2")(Inkling2QuantConfig)
@@ -55,8 +57,16 @@ def register() -> None:
         "DFlashInkling2DSparkModel",
         "inkling_v100.dspark:Inkling2DSparkModel",
     )
+    ModelRegistry.register_model(
+        "I2MDFly2DraftModel",
+        "inkling_v100.dfly2:Inkling2DFly2DraftModel",
+    )
+    ModelRegistry.register_model(
+        "DFlashI2MDFly2DraftModel",
+        "inkling_v100.dfly2:Inkling2DFly2DraftModel",
+    )
 
-    # 4. Route `inkling2_dspark` draft configs to `Inkling2DSparkSpeculator` without
+    # 4. Route `inkling2_dspark` and `inkling2_dfly2_kv` draft configs without
     # editing 1Cat-vLLM site-packages.
     _install_dspark_speculator_hook()
     from .conv_state import install_ring_conv_hook
@@ -65,8 +75,29 @@ def register() -> None:
     install_ring_conv_hook()
     apply_spec_k()
     log.info(
-        "inkling_v100: registered Inkling2Loop/Inkling2/DSpark configs, quant, models, and speculator hook for sm_70"
+        "inkling_v100: registered Inkling2Loop/Inkling2/DSpark/DFly2 configs, quant, models, and speculator hook for sm_70"
     )
+
+
+def _is_inkling2_dfly2(vllm_config) -> bool:
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return False
+    if os.environ.get("INKLING_DFLY2_CKPT", "").strip():
+        mc_archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
+        if any("Inkling2" in a for a in mc_archs):
+            return True
+    draft_cfg = getattr(spec, "draft_model_config", None)
+    hf_cfg = getattr(draft_cfg, "hf_config", None)
+    if hf_cfg is None:
+        return False
+    if getattr(hf_cfg, "model_type", None) == "inkling2_dfly2_kv":
+        return True
+    inner = getattr(hf_cfg, "model", None)
+    if getattr(inner, "model_type", None) == "inkling2_dfly2_kv":
+        return True
+    archs = getattr(hf_cfg, "architectures", None) or ()
+    return ("I2MDFly2DraftModel" in archs) or ("DFlashI2MDFly2DraftModel" in archs)
 
 
 def _is_inkling2_dspark(vllm_config) -> bool:
@@ -95,6 +126,10 @@ def _install_dspark_speculator_hook() -> None:
     orig_init = sd.init_speculator
 
     def _wrapped_init_speculator(vllm_config, device):
+        if _is_inkling2_dfly2(vllm_config):
+            from .dfly2 import Inkling2DFly2Speculator
+
+            return Inkling2DFly2Speculator(vllm_config, device)
         if _is_inkling2_dspark(vllm_config):
             from .speculator import Inkling2DSparkSpeculator
 

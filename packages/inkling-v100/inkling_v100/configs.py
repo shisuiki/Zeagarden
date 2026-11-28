@@ -296,3 +296,89 @@ class Inkling2DSparkConfig(PreTrainedConfig):
             final_logit_softcapping=text.final_logit_softcapping or 30.0,
             torch_dtype="float16",
         )
+
+
+class Inkling2DFly2Config(PreTrainedConfig):
+    """Zero-KV-cache DFly2-KV 7-token speculative drafter config for Inkling-2-Mini."""
+
+    model_type = "inkling2_dfly2_kv"
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int = 2304,
+        intermediate_size: int = 8192,
+        num_hidden_layers: int = 3,
+        num_attention_heads: int = 24,
+        num_key_value_heads: int = 8,
+        head_dim: int = 128,
+        d_rel: int = 16,
+        rel_extent: int = 1024,
+        sliding_window_size: int = 1024,
+        qk_l2_clip_threshold: float = 22.627416997969522,
+        rel_l2_clip_threshold: float = 8.0,
+        log_scaling_n_floor: int = 8192,
+        log_scaling_alpha: float = 0.1,
+        rms_norm_eps: float = 1e-6,
+        final_logit_softcapping: float = 30.0,
+        vocab_size: int = 200058,
+        padded_vocab_size: int = 201024,
+        target_kv_layers: list[int] | None = None,
+        local_layer_ids: list[int] | None = None,
+        block_size: int = 8,
+        mtp_fusion: bool = True,
+        enable_hidden_correction: bool = True,
+        hidden_correction_intermediate_size: int = 2304,
+        attentive_correction: bool = True,
+        attentive_correction_block_gated: bool = True,
+        attentive_correction_is_local: bool = True,
+        causal_draft_attn: bool = False,
+        max_position_embeddings: int = 1048576,
+        **kwargs: Any,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.d_rel = d_rel
+        self.rel_extent = rel_extent
+        self.sliding_window_size = sliding_window_size
+        self.qk_l2_clip_threshold = qk_l2_clip_threshold
+        self.rel_l2_clip_threshold = rel_l2_clip_threshold
+        self.log_scaling_n_floor = log_scaling_n_floor
+        self.log_scaling_alpha = log_scaling_alpha
+        self.rms_norm_eps = rms_norm_eps
+        self.final_logit_softcapping = final_logit_softcapping
+        self.padded_vocab_size = padded_vocab_size
+        self.vocab_size = vocab_size
+        self.unpadded_vocab_size = vocab_size
+        self.target_kv_layers = list(target_kv_layers if target_kv_layers is not None else [20, 23, 22])
+        self.local_layer_ids = list(local_layer_ids if local_layer_ids is not None else [0, 2])
+        self.block_size = block_size
+        self.draft_block_size = block_size
+        self.mtp_fusion = mtp_fusion
+        self.enable_hidden_correction = enable_hidden_correction
+        self.hidden_correction_intermediate_size = hidden_correction_intermediate_size
+        self.attentive_correction = attentive_correction
+        self.attentive_correction_block_gated = attentive_correction_block_gated
+        self.attentive_correction_is_local = attentive_correction_is_local
+        self.causal_draft_attn = causal_draft_attn
+        self.max_position_embeddings = max_position_embeddings
+        self.is_causal = False
+        self.mask_token_id = 0
+        # Zero-cost sentinel aux layer (final output reference only) so vLLM V2
+        # `method="dflash"` unpacks `(out, [out])` with zero extra tensor copies.
+        self.target_layer_ids = [48]
+        self.eagle_aux_hidden_state_layer_ids = [48]
+        self.dflash_config = {
+            "block_size": block_size,
+            "mask_token_id": 0,
+            "is_causal": False,
+            "sample_from_anchor": False,
+            "target_layer_ids": [48],
+        }
+        kwargs.setdefault("architectures", ["I2MDFly2DraftModel"])
+        kwargs.setdefault("torch_dtype", "float16")
+        super().__init__(tie_word_embeddings=False, **kwargs)
